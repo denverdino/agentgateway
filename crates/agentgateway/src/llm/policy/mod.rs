@@ -157,6 +157,10 @@ impl<'de> Deserialize<'de> for SortedRoutes {
 #[apply(schema!)]
 #[derive(Default)]
 pub struct Policy {
+	/// Operator-owned managed tool runtime configuration selected with the model backend.
+	#[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+	#[cfg_attr(feature = "schema", schemars(skip))]
+	pub(crate) tool_runtime: Option<Arc<crate::llm::tool_runtime::ToolRegistry>>,
 	/// Prompt and response guardrails to apply to LLM traffic.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub prompt_guard: Option<PromptGuard>,

@@ -85,6 +85,7 @@ indexmap = { workspace = true }
 ipnet.workspace = true
 itertools.workspace = true
 jsonwebtoken.workspace = true
+jsonschema.workspace = true
 lazy_static.workspace = true
 mediatype = "0.21.0"
 notify-debouncer-full.workspace = true

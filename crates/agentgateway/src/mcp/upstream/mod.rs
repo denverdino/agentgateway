@@ -18,6 +18,7 @@ use rmcp::model::{
 };
 use rmcp::transport::TokioChildProcess;
 use rmcp::transport::common::http_header::HEADER_SESSION_ID;
+pub(crate) use streamablehttp::Client as McpStreamableClient;
 use thiserror::Error;
 use tokio::process::Command;
 
@@ -39,6 +40,7 @@ pub struct IncomingRequestContext {
 	headers: http::HeaderMap,
 	ext: ::http::Extensions,
 	authority: Option<::http::uri::Authority>,
+	redact_remote_names: bool,
 }
 
 impl IncomingRequestContext {
@@ -50,6 +52,7 @@ impl IncomingRequestContext {
 			headers: http::HeaderMap::new(),
 			ext: ::http::Extensions::new(),
 			authority: None,
+			redact_remote_names: false,
 		}
 	}
 	pub fn new(parts: &::http::request::Parts) -> Self {
@@ -59,6 +62,25 @@ impl IncomingRequestContext {
 			headers: parts.headers.clone(),
 			ext: parts.extensions.clone(),
 			authority: parts.uri.authority().cloned(),
+			redact_remote_names: false,
+		}
+	}
+	/// Construct a context for an internally-originated outbound MCP request.
+	///
+	/// Unlike `new`, this deliberately does not inherit the downstream URI or
+	/// headers. In particular, a Responses API bearer token must never be sent
+	/// to a client-selected MCP server.
+	pub(crate) fn outbound(extensions: &::http::Extensions, headers: http::HeaderMap) -> Self {
+		let authority = headers
+			.get(http::header::HOST)
+			.and_then(|value| ::http::uri::Authority::try_from(value.as_bytes()).ok());
+		Self {
+			method: ::http::Method::POST,
+			uri: ::http::Uri::from_static("/"),
+			headers,
+			ext: extensions.clone(),
+			authority,
+			redact_remote_names: true,
 		}
 	}
 	pub fn headers_mut(&mut self) -> &mut http::HeaderMap {
@@ -135,12 +157,23 @@ impl IncomingRequestContext {
 				})
 			})
 		})?;
-		span.rename_span(name);
-		span.add_attribute(KeyValue::new("mcp.target", target_name.to_string()));
+		span.rename_span(if self.redact_remote_names {
+			"mcp responses_remote_mcp".to_owned()
+		} else {
+			name
+		});
+		span.add_attribute(KeyValue::new(
+			"mcp.target",
+			if self.redact_remote_names {
+				"responses_remote_mcp".to_owned()
+			} else {
+				target_name.to_string()
+			},
+		));
 		if let Some(method) = method {
 			span.add_attribute(KeyValue::new("mcp.method.name", method.to_owned()));
 		}
-		if let Some(tool_name) = tool_name {
+		if let Some(tool_name) = tool_name.filter(|_| !self.redact_remote_names) {
 			span.add_attribute(KeyValue::new("gen_ai.tool.name", tool_name.to_owned()));
 		}
 		span.inject_headers(self.headers_mut());
@@ -773,6 +806,24 @@ mod tests {
 		);
 		assert_eq!(req.headers().get(http::header::HOST), None);
 		assert_eq!(req.uri().path(), "/mcp");
+	}
+
+	#[test]
+	fn outbound_request_context_applies_explicit_host_as_authority() {
+		let mut headers = http::HeaderMap::new();
+		headers.insert(http::header::HOST, "weather.example.test".parse().unwrap());
+		let ctx = IncomingRequestContext::outbound(&::http::Extensions::new(), headers);
+		let mut req = ::http::Request::builder()
+			.uri("http://192.0.2.10:443/mcp")
+			.body(crate::http::Body::empty())
+			.unwrap();
+
+		ctx.apply(&mut req).unwrap();
+
+		assert_eq!(
+			req.uri().authority().map(|authority| authority.as_str()),
+			Some("weather.example.test")
+		);
 	}
 
 	fn ctx_with_headers(headers: &[(&str, &str)]) -> IncomingRequestContext {

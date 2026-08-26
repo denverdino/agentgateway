@@ -1,0 +1,136 @@
+---
+source: crates/agentgateway/src/types/local_tests.rs
+assertion_line: 433
+description: "Config normalization test for llm_tool_runtime: YAML -> LocalConfig -> NormalizedLocalConfig -> YAML"
+---
+binds:
+  - key: bind/4000
+    address: "[::]:4000"
+    protocol: http
+    tunnelProtocol: direct
+    mode: standard
+    listeners:
+      llm:
+        gatewayName: name
+        gatewayNamespace: ns
+        hostname: "*"
+        key: llm
+        listenerName: llm
+        protocol: HTTP
+listener_routes:
+  - - llm
+    - - backends:
+          - backend: "/llm:router"
+            weight: 1
+        key: "llm:request"
+        matches:
+          - path:
+              pathPrefix: /
+        name: "llm:request"
+        namespace: internal
+listener_tcp_routes:
+  - - llm
+    - []
+policies: []
+backends:
+  - backend:
+      ai:
+        name: "llm:model:test:0"
+        namespace: ""
+        target:
+          providers:
+            - active:
+                test:
+                  endpoint:
+                    name: test
+                    provider:
+                      openAI: {}
+                    hostOverride: ~
+                    pathOverride: ~
+                    pathPrefix: ~
+                    tokenize: false
+                    inlinePolicies:
+                      - backendAuth:
+                          key:
+                            value: "<redacted>"
+                  info:
+                    health: 1
+                    requestLatency: 0
+                    pendingRequests: 0
+                    totalRequests: 0
+                    consecutiveFailures: 0
+                    timesEjected: 0
+                    evictedUntil: ~
+                  capacity: 1
+              rejected: {}
+    inlinePolicies:
+      - ai:
+          toolRuntime:
+            maxArgumentsBytes: 65536
+            maxOutputBytes: 1048576
+            maxParallelToolCalls: 4
+            maxRounds: 8
+            maxToolCalls: 16
+            tools:
+              - name: web_search
+                builtin: webSearch
+                backend:
+                  type: http
+                  url: "https://web-search.example.com/"
+                  timeout: 15s
+                  bearerToken: "<redacted>"
+              - name: code_interpreter
+                builtin: codeInterpreter
+                backend:
+                  type: e2b
+                  apiUrl: "https://api.e2b.example.com/"
+                  domain: e2b.example.com
+                  timeout: 30s
+                  apiKey: "<redacted>"
+              - name: get_weather
+                builtin: ~
+                backend:
+                  type: http
+                  url: "https://weather.example.com/"
+                  timeout: 5s
+                  bearerToken: "<redacted>"
+            totalTimeout: 2m0s
+  - backend:
+      llmRouter:
+        name: "llm:router"
+        namespace: ""
+        target:
+          models:
+            - name: test
+              created: 0
+              visibility: public
+              headerMatches: []
+              backend:
+                backend: "/llm:model:test:0"
+                weight: 1
+              policies:
+                llm:
+                  routes:
+                    "*": passthrough
+                    /v1/chat/completions: completions
+                    /v1/embeddings: embeddings
+                    /v1/images/edits: detect
+                    /v1/images/generations: detect
+                    /v1/images/variations: detect
+                    /v1/messages: messages
+                    /v1/messages/count_tokens: anthropicTokenCount
+                    /v1/rerank: rerank
+                    /v1/responses: responses
+                    /v1/responses/compact: detect
+                    /v2/rerank: rerank
+                    ":countTokens": geminiCountTokens
+                    ":generateContent": generateContent
+                    ":rawPredict": messages
+                    ":streamGenerateContent": generateContent
+                    ":streamRawPredict": messages
+                authorization: ~
+              backendPolicies: []
+          virtualModels: []
+route_groups: []
+workloads: []
+services: []

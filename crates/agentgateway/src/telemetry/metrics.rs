@@ -15,6 +15,10 @@ use prometheus_client::registry::{Metric, Unit};
 use tracing::{debug, trace};
 
 use crate::HistogramMode;
+use crate::llm::tool_runtime::{
+	SandboxOperationDurationLabels, SandboxOperationLabels, ToolCallDurationLabels, ToolCallLabels,
+	ToolLabels, ToolRuntimeLimitLabels, ToolRuntimeOutcomeLabels,
+};
 use crate::mcp::MCPOperation;
 use crate::proxy::ProxyResponseReason;
 use crate::types::agent::TransportProtocol;
@@ -198,6 +202,8 @@ pub enum OutboundCallSubtype {
 	Http,
 	Llm,
 	Mcp,
+	ToolHttp,
+	ToolE2b,
 
 	// Policy
 	ExtAuthz,
@@ -214,6 +220,8 @@ impl OutboundCallSubtype {
 			Self::Http => "Http",
 			Self::Llm => "Llm",
 			Self::Mcp => "Mcp",
+			Self::ToolHttp => "ToolHttp",
+			Self::ToolE2b => "ToolE2b",
 			Self::ExtAuthz => "ExtAuthz",
 			Self::Substrate => "Substrate",
 			Self::ExtProc => "ExtProc",
@@ -293,6 +301,16 @@ pub struct Metrics {
 
 	// metrics for request retries
 	pub retries: Counter,
+
+	pub tool_runtime_requests: Family<ToolRuntimeOutcomeLabels, counter::Counter>,
+	pub tool_runtime_model_rounds: Family<ToolRuntimeOutcomeLabels, counter::Counter>,
+	pub tool_runtime_model_round_duration: PromHistogram,
+	pub tool_runtime_calls: Family<ToolCallLabels, counter::Counter>,
+	pub tool_runtime_call_duration: Histogram<ToolCallDurationLabels>,
+	pub tool_runtime_sandbox_operations: Family<SandboxOperationLabels, counter::Counter>,
+	pub tool_runtime_sandbox_operation_duration: Histogram<SandboxOperationDurationLabels>,
+	pub tool_runtime_limit_exhaustions: Family<ToolRuntimeLimitLabels, counter::Counter>,
+	pub tool_runtime_output_truncations: Family<ToolLabels, counter::Counter>,
 }
 
 // FilteredRegistry is a wrapper around Registry that allows to filter out certain metrics.
@@ -415,6 +433,66 @@ impl Metrics {
 		);
 
 		Metrics {
+			tool_runtime_requests: build(
+				&mut registry,
+				"tool_runtime_requests",
+				"Total managed Responses tool runtime requests by final outcome",
+			),
+			tool_runtime_model_rounds: build(
+				&mut registry,
+				"tool_runtime_model_rounds",
+				"Total model rounds in the managed Responses tool runtime by outcome",
+			),
+			tool_runtime_model_round_duration: {
+				let m = histogram(histogram_mode, &HTTP_REQUEST_DURATION_BUCKET);
+				registry.register_with_unit(
+					"tool_runtime_model_round_duration",
+					"Duration of managed Responses tool runtime model rounds (seconds)",
+					Unit::Seconds,
+					m.clone(),
+				);
+				m
+			},
+			tool_runtime_calls: build(
+				&mut registry,
+				"tool_runtime_calls",
+				"Total managed Responses tool calls by configured tool, backend, and outcome",
+			),
+			tool_runtime_call_duration: {
+				let m = histogram_family(histogram_mode, &HTTP_REQUEST_DURATION_BUCKET);
+				registry.register_with_unit(
+					"tool_runtime_call_duration",
+					"Duration of managed Responses tool calls (seconds)",
+					Unit::Seconds,
+					m.clone(),
+				);
+				m
+			},
+			tool_runtime_sandbox_operations: build(
+				&mut registry,
+				"tool_runtime_sandbox_operations",
+				"Total bounded Sandbox operations by operation and outcome",
+			),
+			tool_runtime_sandbox_operation_duration: {
+				let m = histogram_family(histogram_mode, &HTTP_REQUEST_DURATION_BUCKET);
+				registry.register_with_unit(
+					"tool_runtime_sandbox_operation_duration",
+					"Duration of bounded Sandbox operations (seconds)",
+					Unit::Seconds,
+					m.clone(),
+				);
+				m
+			},
+			tool_runtime_limit_exhaustions: build(
+				&mut registry,
+				"tool_runtime_limit_exhaustions",
+				"Total managed tool runtime limit exhaustions by closed limit kind",
+			),
+			tool_runtime_output_truncations: build(
+				&mut registry,
+				"tool_runtime_output_truncations",
+				"Total managed tool outputs truncated by configured tool",
+			),
 			requests: build(
 				&mut registry,
 				"requests",
@@ -563,6 +641,10 @@ impl Metrics {
 			),
 		}
 	}
+}
+
+fn histogram(mode: HistogramMode, buckets: &'static [f64]) -> PromHistogram {
+	HistogramConstructor { mode, buckets }.new_metric()
 }
 
 fn histogram_family<T>(mode: HistogramMode, buckets: &'static [f64]) -> Histogram<T>

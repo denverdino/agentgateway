@@ -129,6 +129,7 @@ insta = { version = "1.47", features = ["json", "redactions", "filters", "yaml"]
 ipnet = { version = "2.12", features = ["serde"] }
 itertools = "0.15"
 jsonwebtoken = { version = "10.4" }
+jsonschema = { version = "0.40", default-features = false }
 lazy_static = "1.5"
 libc = "0.2"
 notify = "8.2"

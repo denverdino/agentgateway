@@ -1,0 +1,46 @@
+# yaml-language-server: $schema=https://agentgateway.dev/schema/config
+config:
+  readinessAddr: 127.0.0.1:19001
+  statsAddr: 127.0.0.1:19002
+
+llm:
+  port: 4000
+  policies:
+    apiKey:
+      keys:
+      - key: $AGENTGATEWAY_API_KEY
+      mode: strict
+      location:
+        header:
+          name: authorization
+          prefix: 'Bearer '
+  toolRuntime:
+    maxRounds: 8
+    maxToolCalls: 16
+    maxParallelToolCalls: 4
+    totalTimeout: 120s
+    maxArgumentsBytes: 65536
+    maxOutputBytes: 1048576
+    tools:
+    - name: web_search
+      builtin: webSearch
+      backend:
+        type: http
+        url: $FC_WEB_SEARCH_URL
+        timeout: 15s
+        bearerToken: $FC_WEB_SEARCH_TOKEN
+    - name: code_interpreter
+      builtin: codeInterpreter
+      backend:
+        type: e2b
+        apiKey: $E2B_API_KEY
+        apiUrl: $E2B_API_URL
+        domain: $E2B_DOMAIN
+        timeout: 120s
+  models:
+  - name: smart
+    provider: openAI
+    params:
+      model: $AGENTGATEWAY_UPSTREAM_MODEL
+      apiKey: $AGENTGATEWAY_UPSTREAM_API_KEY
+      baseUrl: $AGENTGATEWAY_UPSTREAM_BASE_URL

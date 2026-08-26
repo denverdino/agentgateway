@@ -174,6 +174,7 @@ async fn custom_provider_completions_inbound_renders_native_gemini() {
 		request: mut forwarded,
 		llm_request,
 		upstream_route_type,
+		..
 	} = provider
 		.process_completions_request(
 			&openai_test_backend_info(),
@@ -742,6 +743,1014 @@ async fn openai_inline_moderation_injected_for_responses() {
 		forwarded_json["moderation"],
 		openai_inline_moderation_value()
 	);
+}
+
+#[tokio::test]
+async fn responses_inactive_path_reuses_chat_renderer() {
+	let provider = AIProvider::OpenAI(openai::Provider {
+		model: None,
+		moderation: None,
+	});
+	let backend_info = openai_test_backend_info();
+	let request_body = br#"{"model":"gpt-5","input":"hello","stream":false}"#.to_vec();
+	let request = ::http::Request::builder()
+		.uri("/v1/responses")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(request_body.clone()))
+		.unwrap();
+	let RequestResult::Success {
+		request: inactive_request,
+		llm_request: inactive_info,
+		..
+	} = provider
+		.process_responses_request(&backend_info, None, request, false, &mut None, None)
+		.await
+		.expect("inactive Responses request should process")
+	else {
+		panic!("expected forwarded request");
+	};
+
+	let request = ::http::Request::builder()
+		.uri("/v1/responses")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(request_body))
+		.unwrap();
+	let (parts, mut request) = provider
+		.read_body_and_default_model::<types::responses::Request>(None, request, &mut None)
+		.await
+		.expect("Responses request should parse");
+	provider.apply_model_alias(None, &mut request);
+	let prepared = provider
+		.prepare_chat_request(
+			&backend_info,
+			None,
+			InputFormat::Responses,
+			request,
+			parts,
+			false,
+			&mut None,
+			None,
+		)
+		.await
+		.expect("Responses request preparation should succeed")
+		.expect("Responses request should not be guardrail-rejected");
+	let PreparedChatRequest {
+		request,
+		parts,
+		translation,
+		llm_request,
+	} = prepared;
+	let RequestResult::Success {
+		request: shared_request,
+		llm_request: shared_info,
+		..
+	} = provider
+		.render_prepared_chat_request(
+			None,
+			types::ChatRequest::Responses(request),
+			parts,
+			translation,
+			llm_request,
+			&mut None,
+			None,
+		)
+		.expect("shared Responses request rendering should succeed")
+	else {
+		panic!("expected shared forwarded request");
+	};
+
+	let inactive_body: Value =
+		serde_json::from_slice(&inactive_request.collect().await.unwrap().to_bytes())
+			.expect("inactive Responses body should be JSON");
+	let shared_body: Value =
+		serde_json::from_slice(&shared_request.collect().await.unwrap().to_bytes())
+			.expect("shared Responses body should be JSON");
+	assert_eq!(inactive_body, shared_body);
+	assert_eq!(
+		shared_body,
+		json!({
+			"model": "gpt-5",
+			"input": "hello",
+			"stream": false
+		})
+	);
+	assert_eq!(inactive_info.input_format, InputFormat::Responses);
+	assert!(!inactive_info.streaming);
+	assert_eq!(shared_info.input_format, InputFormat::Responses);
+	assert!(!shared_info.streaming);
+}
+
+#[tokio::test]
+async fn responses_tool_runtime_activates_after_request_policy_defaults() {
+	use std::collections::HashMap;
+	use std::sync::Arc;
+	use std::time::Duration;
+
+	use secrecy::SecretString;
+
+	use crate::llm::tool_runtime::{
+		ManagedToolConfig, RuntimeLimits, ToolBackendConfig, ToolRegistry, ToolRuntimeConfig,
+	};
+
+	let provider = AIProvider::OpenAI(openai::Provider {
+		model: None,
+		moderation: None,
+	});
+	let backend_info = openai_test_backend_info();
+	let policy = Policy {
+		tool_runtime: Some(Arc::new(
+			ToolRegistry::compile(ToolRuntimeConfig {
+				limits: RuntimeLimits {
+					total_timeout: Duration::from_secs(30),
+					max_rounds: 4,
+					max_tool_calls: 4,
+					max_parallel_tool_calls: 2,
+					max_arguments_bytes: 1024,
+					max_output_bytes: 4096,
+				},
+				tools: vec![ManagedToolConfig {
+					name: "managed".to_owned(),
+					builtin: None,
+					backend: ToolBackendConfig::Http {
+						url: "http://127.0.0.1:1/invoke".parse().unwrap(),
+						timeout: Duration::from_secs(5),
+						bearer_token: Some(SecretString::from("operator-secret")),
+					},
+				}],
+			})
+			.unwrap(),
+		)),
+		defaults: Some(HashMap::from([(
+			"tools".to_owned(),
+			json!([{
+				"type": "function",
+				"name": "managed",
+				"description": "added by policy",
+				"parameters": {"type": "object"}
+			}]),
+		)])),
+		..Default::default()
+	};
+	let request = ::http::Request::builder()
+		.uri("/v1/responses")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(br#"{"model":"gpt-5","input":"hello"}"#.to_vec()))
+		.unwrap();
+
+	let RequestResult::Success {
+		request: forwarded,
+		tool_runtime: Some(runtime),
+		..
+	} = provider
+		.process_responses_request(
+			&backend_info,
+			Some(&policy),
+			request,
+			false,
+			&mut None,
+			None,
+		)
+		.await
+		.expect("managed Responses request should process")
+	else {
+		panic!("expected active managed tool runtime");
+	};
+
+	let forwarded = forwarded.collect().await.unwrap().to_bytes();
+	let forwarded: Value = serde_json::from_slice(&forwarded).unwrap();
+	assert_eq!(forwarded["tools"][0]["name"], "managed");
+	assert_eq!(
+		serde_json::to_value(runtime.canonical_request).unwrap()["tools"][0]["description"],
+		"added by policy"
+	);
+}
+
+#[derive(Clone)]
+struct Task12ResponseSequence {
+	responses: std::sync::Arc<Vec<Value>>,
+	next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl wiremock::Respond for Task12ResponseSequence {
+	fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+		let index = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		let response = self
+			.responses
+			.get(index)
+			.or_else(|| self.responses.last())
+			.expect("Task 12 response sequence is non-empty")
+			.clone();
+		wiremock::ResponseTemplate::new(200).set_body_json(response)
+	}
+}
+
+#[derive(Clone)]
+struct Task12BackendBarrier {
+	inner: std::sync::Arc<(
+		std::sync::Mutex<Task12BackendBarrierState>,
+		std::sync::Condvar,
+	)>,
+	timeout: std::time::Duration,
+}
+
+#[derive(Default)]
+struct Task12BackendBarrierState {
+	arrived: std::collections::HashSet<&'static str>,
+	confirmed: std::collections::HashSet<&'static str>,
+}
+
+impl Task12BackendBarrier {
+	fn new(timeout: std::time::Duration) -> Self {
+		Self {
+			inner: std::sync::Arc::new((
+				std::sync::Mutex::new(Task12BackendBarrierState::default()),
+				std::sync::Condvar::new(),
+			)),
+			timeout,
+		}
+	}
+
+	fn arrive_and_wait(&self, label: &'static str) -> bool {
+		let (state, changed) = &*self.inner;
+		let deadline = std::time::Instant::now() + self.timeout;
+		let mut state = state.lock().expect("Task 12 backend barrier lock");
+		state.arrived.insert(label);
+		changed.notify_all();
+		while state.arrived.len() < 2 {
+			let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+			if remaining.is_zero() {
+				return false;
+			}
+			let (next, result) = changed
+				.wait_timeout(state, remaining)
+				.expect("Task 12 backend barrier wait");
+			state = next;
+			if result.timed_out() && state.arrived.len() < 2 {
+				return false;
+			}
+		}
+		state.confirmed.insert(label);
+		true
+	}
+
+	fn confirmed_labels(&self) -> std::collections::HashSet<&'static str> {
+		self
+			.inner
+			.0
+			.lock()
+			.expect("Task 12 backend barrier lock")
+			.confirmed
+			.clone()
+	}
+}
+
+#[derive(Clone)]
+struct Task12DelayedToolResponse {
+	label: &'static str,
+	barrier: Task12BackendBarrier,
+	delay: std::time::Duration,
+	body: Value,
+	status: u16,
+}
+
+impl wiremock::Respond for Task12DelayedToolResponse {
+	fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+		if !self.barrier.arrive_and_wait(self.label) {
+			return wiremock::ResponseTemplate::new(500);
+		}
+		wiremock::ResponseTemplate::new(self.status)
+			.set_delay(self.delay)
+			.set_body_json(self.body.clone())
+	}
+}
+
+fn task12_responses_body(id: &str, output: Value, input_tokens: u64, output_tokens: u64) -> Value {
+	json!({
+		"id": id,
+		"object": "response",
+		"created_at": 1,
+		"status": "completed",
+		"model": "mock-model",
+		"output": output,
+		"usage": {
+			"input_tokens": input_tokens,
+			"output_tokens": output_tokens,
+			"total_tokens": input_tokens + output_tokens
+		}
+	})
+}
+
+fn task12_tool_runtime_backend(
+	model: &wiremock::MockServer,
+	web_search: &wiremock::MockServer,
+	sandbox: &wiremock::MockServer,
+) -> crate::types::agent::BackendWithPolicies {
+	use std::sync::Arc;
+	use std::time::Duration;
+
+	use secrecy::SecretString;
+
+	use crate::llm::tool_runtime::{
+		BuiltinTool, ManagedToolConfig, RuntimeLimits, ToolBackendConfig, ToolRegistry,
+		ToolRuntimeConfig,
+	};
+	use crate::types::agent::{Backend, BackendTrafficPolicy, ResourceName, Target};
+
+	let runtime = Arc::new(
+		ToolRegistry::compile(ToolRuntimeConfig {
+			limits: RuntimeLimits {
+				total_timeout: Duration::from_secs(10),
+				max_rounds: 4,
+				max_tool_calls: 4,
+				max_parallel_tool_calls: 2,
+				max_arguments_bytes: 4096,
+				max_output_bytes: 16_384,
+			},
+			tools: vec![
+				ManagedToolConfig {
+					name: "web_search".to_owned(),
+					builtin: Some(BuiltinTool::WebSearch),
+					backend: ToolBackendConfig::Http {
+						url: format!("http://{}/invoke", web_search.address())
+							.parse()
+							.expect("loopback Web Search URL"),
+						timeout: Duration::from_secs(3),
+						bearer_token: Some(SecretString::from("task12-web-token")),
+					},
+				},
+				ManagedToolConfig {
+					name: "code_interpreter".to_owned(),
+					builtin: Some(BuiltinTool::CodeInterpreter),
+					backend: ToolBackendConfig::E2b {
+						api_url: format!("http://{}", sandbox.address())
+							.parse()
+							.expect("loopback E2B API URL"),
+						domain: "sandbox.example.com".into(),
+						timeout: Duration::from_secs(3),
+						api_key: SecretString::from("task12-sandbox-token"),
+					},
+				},
+			],
+		})
+		.expect("valid mixed-tool runtime"),
+	);
+	let mut policy = Arc::unwrap_or_clone(crate::llm::model_router::default_route_types());
+	policy.tool_runtime = Some(runtime);
+	let provider_name = agent_core::strng::new("task12-mock-openai");
+	let provider = crate::llm::NamedAIProvider {
+		name: provider_name.clone(),
+		provider: AIProvider::OpenAI(openai::Provider {
+			model: None,
+			moderation: None,
+		}),
+		provider_backend: None,
+		host_override: Some(Target::Address(*model.address())),
+		path_override: None,
+		path_prefix: None,
+		tokenize: false,
+		inline_policies: vec![
+			BackendTrafficPolicy::backend_auth(crate::http::auth::BackendAuthKind::Key {
+				value: SecretString::from("task12-model-token"),
+				location: None,
+			}),
+			BackendTrafficPolicy::AI(Arc::new(policy)),
+		],
+	};
+	Backend::AI(
+		ResourceName::new("task12-managed-llm".into(), "".into()),
+		crate::llm::AIBackend {
+			providers: crate::types::loadbalancer::EndpointSet::new(vec![vec![(
+				provider_name,
+				provider,
+			)]]),
+		},
+	)
+	.into()
+}
+
+#[test]
+fn task12_backend_barrier_requires_both_concurrent_arrivals() {
+	use std::time::{Duration, Instant};
+
+	let serial = Task12BackendBarrier::new(Duration::from_millis(40));
+	let started = Instant::now();
+	assert!(!serial.arrive_and_wait("web_search"));
+	assert!(
+		started.elapsed() < Duration::from_millis(250),
+		"a serial backend must fail its bounded handshake quickly"
+	);
+
+	let concurrent = Task12BackendBarrier::new(Duration::from_secs(1));
+	let peer = concurrent.clone();
+	let web = std::thread::spawn(move || peer.arrive_and_wait("web_search"));
+	let sandbox = concurrent.arrive_and_wait("sandbox");
+	assert!(sandbox);
+	assert!(web.join().unwrap());
+	assert_eq!(
+		concurrent.confirmed_labels(),
+		["sandbox", "web_search"].into_iter().collect()
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn responses_tool_runtime_dual_builtin_cross_component_acceptance() {
+	use std::sync::Arc;
+	use std::time::Duration;
+
+	use ::http::Method;
+	use wiremock::Mock;
+
+	use crate::llm::tool_runtime::{
+		SandboxOperation, SandboxOperationLabels, SandboxOperationOutcome, ToolBackendLabel,
+		ToolCallLabels, ToolExecutionOutcome, ToolRuntimeOutcome, ToolRuntimeOutcomeLabels,
+	};
+	use crate::test_helpers::proxymock;
+
+	const INTERMEDIATE_TEXT: &str = "task12-intermediate-must-not-leak";
+	const WEB_CALL_ID: &str = "call-web-first";
+	const CODE_CALL_ID: &str = "call-code-second";
+	const CODE: &str = "print(6 * 7)";
+
+	let intermediate = vec![
+		json!({
+			"type": "message",
+			"id": "msg_intermediate",
+			"role": "assistant",
+			"status": "completed",
+			"content": [{
+				"type": "output_text",
+				"text": INTERMEDIATE_TEXT,
+				"annotations": []
+			}]
+		}),
+		json!({
+			"type": "function_call",
+			"id": "fc_web",
+			"call_id": WEB_CALL_ID,
+			"name": "_agentgateway_web_search",
+			"arguments": "{\"query\":\"current agentgateway release\"}",
+			"status": "completed"
+		}),
+		json!({
+			"type": "function_call",
+			"id": "fc_code",
+			"call_id": CODE_CALL_ID,
+			"name": "_agentgateway_code_interpreter",
+			"arguments": format!("{{\"code\":{}}}", serde_json::to_string(CODE).unwrap()),
+			"status": "completed"
+		}),
+	];
+	let final_output = json!([{
+		"type": "message",
+		"id": "msg_final",
+		"role": "assistant",
+		"status": "completed",
+		"content": [{
+			"type": "output_text",
+			"text": "The searched release value is 42.",
+			"annotations": []
+		}]
+	}]);
+	let model = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(Task12ResponseSequence {
+			responses: Arc::new(vec![
+				task12_responses_body("resp-intermediate", json!(intermediate.clone()), 11, 7),
+				task12_responses_body("resp-final", final_output, 13, 5),
+			]),
+			next: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+		})
+		.mount(&model)
+		.await;
+
+	let backend_barrier = Task12BackendBarrier::new(Duration::from_secs(1));
+	let web_search = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(Task12DelayedToolResponse {
+			label: "web_search",
+			barrier: backend_barrier.clone(),
+			delay: Duration::from_millis(500),
+			body: json!({
+				"results": [{
+					"title": "AgentGateway release",
+					"url": "https://agentgateway.dev/release",
+					"snippet": "The stable release value is 42.",
+					"published_at": null
+				}]
+			}),
+			status: 200,
+		})
+		.mount(&web_search)
+		.await;
+	let sandbox = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.and(wiremock::matchers::path("/sandboxes"))
+		.respond_with(Task12DelayedToolResponse {
+			label: "sandbox",
+			barrier: backend_barrier.clone(),
+			delay: Duration::from_millis(40),
+			body: json!({
+				"clientID": "task12-client",
+				"envdVersion": "0.1.0",
+				"sandboxID": "task12-sandbox",
+				"templateID": "code-interpreter-v1",
+				"domain": "sandbox.example.com",
+				"envdAccessToken": "task12-envd-token",
+				"trafficAccessToken": "task12-traffic-token"
+			}),
+			status: 201,
+		})
+		.mount(&sandbox)
+		.await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.and(wiremock::matchers::path("/contexts"))
+		.respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!({
+			"id": "task12-context", "language": "python", "cwd": "/home/user"
+		})))
+		.mount(&sandbox)
+		.await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.and(wiremock::matchers::path("/execute"))
+		.respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+			"{\"type\":\"stdout\",\"text\":\"42\\n\",\"timestamp\":1}\n{\"type\":\"number_of_executions\",\"execution_count\":1}\n",
+		))
+		.mount(&sandbox)
+		.await;
+	Mock::given(wiremock::matchers::method("DELETE"))
+		.and(wiremock::matchers::path("/contexts/task12-context"))
+		.respond_with(wiremock::ResponseTemplate::new(204))
+		.mount(&sandbox)
+		.await;
+	Mock::given(wiremock::matchers::method("DELETE"))
+		.and(wiremock::matchers::path("/sandboxes/task12-sandbox"))
+		.respond_with(wiremock::ResponseTemplate::new(204))
+		.mount(&sandbox)
+		.await;
+
+	let bind = proxymock::setup_proxy_test("{}")
+		.expect("Task 12 proxy harness")
+		.with_raw_backend(task12_tool_runtime_backend(&model, &web_search, &sandbox))
+		.with_bind(proxymock::simple_bind())
+		.with_route(proxymock::basic_named_route("/task12-managed-llm".into()));
+	let io = bind.serve_http(proxymock::BIND_KEY);
+	let request = serde_json::to_vec(&json!({
+		"model": "smart",
+		"input": "Search the current release and calculate its stable value.",
+		"tools": [
+			{"type": "web_search"},
+			{"type": "code_interpreter", "container": {"type": "auto"}}
+		],
+		"parallel_tool_calls": true,
+		"stream": false
+	}))
+	.unwrap();
+	let response =
+		proxymock::send_request_body(io, Method::POST, "http://lo/v1/responses", &request).await;
+
+	assert_eq!(response.status(), 200);
+	let response: Value =
+		serde_json::from_slice(&proxymock::read_body_raw(response.into_body()).await).unwrap();
+	assert_eq!(response["id"], "resp-final");
+	assert_eq!(response["model"], "mock-model");
+	assert_eq!(response["output"].as_array().unwrap().len(), 1);
+	assert_eq!(response["output"][0]["type"], "message");
+	assert_eq!(
+		response["output"][0]["content"][0]["text"],
+		"The searched release value is 42."
+	);
+	assert_eq!(response["usage"]["input_tokens"], 24);
+	assert_eq!(response["usage"]["output_tokens"], 12);
+	assert_eq!(response["usage"]["total_tokens"], 36);
+	let final_wire = serde_json::to_string(&response).unwrap();
+	for intermediate_value in [
+		INTERMEDIATE_TEXT,
+		WEB_CALL_ID,
+		CODE_CALL_ID,
+		"The stable release value is 42.",
+		"42\\n",
+	] {
+		assert!(
+			!final_wire.contains(intermediate_value),
+			"only the final model round may reach the client"
+		);
+	}
+
+	let model_requests = model.received_requests().await.unwrap();
+	assert_eq!(model_requests.len(), 2, "exactly two model rounds");
+	let first_model_request: Value = serde_json::from_slice(&model_requests[0].body).unwrap();
+	assert_eq!(first_model_request["stream"], false);
+	assert_eq!(
+		first_model_request["tools"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.map(|tool| tool["name"].as_str().unwrap())
+			.collect::<Vec<_>>(),
+		["_agentgateway_web_search", "_agentgateway_code_interpreter"]
+	);
+	let second_model_request: Value = serde_json::from_slice(&model_requests[1].body).unwrap();
+	let canonical_input = second_model_request["input"].as_array().unwrap();
+	assert_eq!(canonical_input.len(), 6);
+	assert_eq!(&canonical_input[1..4], intermediate.as_slice());
+	assert_eq!(canonical_input[4]["type"], "function_call_output");
+	assert_eq!(canonical_input[4]["call_id"], WEB_CALL_ID);
+	assert_eq!(canonical_input[5]["type"], "function_call_output");
+	assert_eq!(canonical_input[5]["call_id"], CODE_CALL_ID);
+	let web_output: Value =
+		serde_json::from_str(canonical_input[4]["output"].as_str().unwrap()).unwrap();
+	let code_output: Value =
+		serde_json::from_str(canonical_input[5]["output"].as_str().unwrap()).unwrap();
+	assert_eq!(web_output["ok"], true);
+	assert_eq!(web_output["results"][0]["title"], "AgentGateway release");
+	assert_eq!(code_output["ok"], true);
+	assert_eq!(code_output["stdout"], "42\n");
+
+	let web_requests = web_search.received_requests().await.unwrap();
+	assert_eq!(web_requests.len(), 1);
+	assert_eq!(
+		web_requests[0]
+			.headers
+			.get("authorization")
+			.and_then(|value| value.to_str().ok()),
+		Some("Bearer task12-web-token")
+	);
+	let web_request: Value = serde_json::from_slice(&web_requests[0].body).unwrap();
+	assert_eq!(web_request["query"], "current agentgateway release");
+	let sandbox_requests = sandbox.received_requests().await.unwrap();
+	assert_eq!(sandbox_requests.len(), 5, "one direct E2B lifecycle");
+	let create = sandbox_requests
+		.iter()
+		.find(|request| request.url.path() == "/sandboxes")
+		.unwrap();
+	assert_eq!(
+		create
+			.headers
+			.get("x-api-key")
+			.and_then(|value| value.to_str().ok()),
+		Some("task12-sandbox-token")
+	);
+	let sandbox_request: Value = serde_json::from_slice(&create.body).unwrap();
+	assert_eq!(sandbox_request["templateID"], "code-interpreter-v1");
+	let execute = sandbox_requests
+		.iter()
+		.find(|request| request.url.path() == "/execute")
+		.unwrap();
+	let execute_request: Value = serde_json::from_slice(&execute.body).unwrap();
+	assert_eq!(execute_request["context_id"], "task12-context");
+	assert_ne!(
+		execute_request["code"], CODE,
+		"gateway wraps code to bound output"
+	);
+
+	assert_eq!(
+		backend_barrier.confirmed_labels(),
+		["sandbox", "web_search"].into_iter().collect(),
+		"each delayed backend must observe its peer before either completes"
+	);
+
+	let web_labels = ToolCallLabels {
+		tool: "web_search".to_owned(),
+		backend: ToolBackendLabel::Http,
+		outcome: ToolExecutionOutcome::Success,
+	};
+	let code_labels = ToolCallLabels {
+		tool: "code_interpreter".to_owned(),
+		backend: ToolBackendLabel::E2b,
+		outcome: ToolExecutionOutcome::Success,
+	};
+	assert_eq!(
+		bind
+			.pi
+			.metrics
+			.tool_runtime_calls
+			.get_or_create(&web_labels)
+			.get(),
+		1
+	);
+	assert_eq!(
+		bind
+			.pi
+			.metrics
+			.tool_runtime_calls
+			.get_or_create(&code_labels)
+			.get(),
+		1
+	);
+	assert_eq!(
+		bind
+			.pi
+			.metrics
+			.tool_runtime_model_rounds
+			.get_or_create(&ToolRuntimeOutcomeLabels {
+				outcome: ToolRuntimeOutcome::Success,
+			})
+			.get(),
+		2
+	);
+	assert_eq!(
+		bind
+			.pi
+			.metrics
+			.tool_runtime_sandbox_operations
+			.get_or_create(&SandboxOperationLabels {
+				operation: SandboxOperation::Execute,
+				outcome: SandboxOperationOutcome::Success,
+			})
+			.get(),
+		1
+	);
+	assert_eq!(
+		bind
+			.pi
+			.metrics
+			.tool_runtime_sandbox_operations
+			.get_or_create(&SandboxOperationLabels {
+				operation: SandboxOperation::Cleanup,
+				outcome: SandboxOperationOutcome::Success,
+			})
+			.get(),
+		1
+	);
+	let bounded_telemetry = format!("{web_labels:?}{code_labels:?}");
+	for content in [INTERMEDIATE_TEXT, WEB_CALL_ID, CODE_CALL_ID, CODE, "42\n"] {
+		assert!(
+			!bounded_telemetry.contains(content),
+			"telemetry labels must remain content-free"
+		);
+	}
+}
+
+mod task12_live_tools {
+	use std::collections::HashMap;
+	use std::path::{Path, PathBuf};
+	use std::time::Duration;
+
+	use serde_json::{Value, json};
+
+	const LIVE_KEYS: [&str; 6] = [
+		"AGENTGATEWAY_LIVE_TOOLS",
+		"FC_WEB_SEARCH_URL",
+		"FC_WEB_SEARCH_TOKEN",
+		"E2B_API_KEY",
+		"E2B_API_URL",
+		"E2B_DOMAIN",
+	];
+	const MAX_LIVE_RESPONSE_BYTES: usize = 1_048_576;
+
+	#[test]
+	fn dotenv_candidates_normalize_worktree_and_main_checkout_roots() {
+		let manifest = Path::new("checkout")
+			.join(".worktrees")
+			.join("task12")
+			.join("crates")
+			.join("agentgateway");
+		assert_eq!(
+			dotenv_candidates_for_manifest(&manifest),
+			vec![
+				Path::new("checkout")
+					.join(".worktrees")
+					.join("task12")
+					.join(".env"),
+				Path::new("checkout").join(".env"),
+			]
+		);
+
+		let main_manifest = Path::new("checkout").join("crates").join("agentgateway");
+		assert_eq!(
+			dotenv_candidates_for_manifest(&main_manifest),
+			vec![Path::new("checkout").join(".env")]
+		);
+	}
+
+	#[test]
+	fn live_response_validation_errors_are_content_free() {
+		const EXTERNAL_VALUE: &str = "external-content-must-not-escape";
+		let web = LiveResponse {
+			status: 502,
+			body: serde_json::to_vec(&json!({"error": EXTERNAL_VALUE})).unwrap(),
+		};
+		let web_error = validate_live_web_search_response(&web).unwrap_err();
+		assert_eq!(web_error, "live Web Search returned non-200 status");
+		assert!(!web_error.contains(EXTERNAL_VALUE));
+	}
+	struct LiveConfiguration {
+		web_search_url: String,
+		web_search_token: String,
+		e2b_api_key: String,
+		e2b_api_url: String,
+		e2b_domain: String,
+	}
+
+	impl LiveConfiguration {
+		fn load() -> Option<Self> {
+			let mut values = HashMap::new();
+			for key in LIVE_KEYS {
+				if let Ok(value) = std::env::var(key)
+					&& !value.is_empty()
+				{
+					values.insert(key.to_owned(), value);
+				}
+			}
+			for file in dotenv_candidates() {
+				load_known_dotenv_values(&file, &mut values);
+			}
+
+			let mut missing = LIVE_KEYS
+				.into_iter()
+				.filter(|key| !values.contains_key(*key))
+				.collect::<Vec<_>>();
+			if values
+				.get("AGENTGATEWAY_LIVE_TOOLS")
+				.is_some_and(|gate| gate != "1")
+			{
+				missing.push("AGENTGATEWAY_LIVE_TOOLS");
+			}
+			missing.sort_unstable();
+			missing.dedup();
+			if !missing.is_empty() {
+				eprintln!("SKIPPED live tools: missing {}", missing.join(", "));
+				return None;
+			}
+
+			Some(Self {
+				web_search_url: values.remove("FC_WEB_SEARCH_URL").unwrap(),
+				web_search_token: values.remove("FC_WEB_SEARCH_TOKEN").unwrap(),
+				e2b_api_key: values.remove("E2B_API_KEY").unwrap(),
+				e2b_api_url: values.remove("E2B_API_URL").unwrap(),
+				e2b_domain: values.remove("E2B_DOMAIN").unwrap(),
+			})
+		}
+	}
+
+	fn dotenv_candidates_for_manifest(manifest_dir: &Path) -> Vec<PathBuf> {
+		let Some(root) = manifest_dir.parent().and_then(Path::parent) else {
+			return Vec::new();
+		};
+		let mut candidates = vec![root.join(".env")];
+		if root
+			.parent()
+			.and_then(Path::file_name)
+			.is_some_and(|name| name == ".worktrees")
+			&& let Some(main_checkout) = root.parent().and_then(Path::parent)
+		{
+			candidates.push(main_checkout.join(".env"));
+		}
+		candidates
+	}
+
+	fn dotenv_candidates() -> Vec<PathBuf> {
+		dotenv_candidates_for_manifest(Path::new(env!("CARGO_MANIFEST_DIR")))
+	}
+
+	fn load_known_dotenv_values(path: &Path, values: &mut HashMap<String, String>) {
+		let Ok(contents) = std::fs::read_to_string(path) else {
+			return;
+		};
+		for line in contents.lines() {
+			let line = line.trim();
+			if line.is_empty() || line.starts_with('#') {
+				continue;
+			}
+			let line = line.strip_prefix("export ").unwrap_or(line);
+			let Some((key, raw_value)) = line.split_once('=') else {
+				continue;
+			};
+			let key = key.trim();
+			if !LIVE_KEYS.contains(&key) || values.contains_key(key) {
+				continue;
+			}
+			let raw_value = raw_value.trim();
+			let value = if raw_value.len() >= 2
+				&& ((raw_value.starts_with('"') && raw_value.ends_with('"'))
+					|| (raw_value.starts_with('\'') && raw_value.ends_with('\'')))
+			{
+				&raw_value[1..raw_value.len() - 1]
+			} else {
+				raw_value
+			};
+			if !value.is_empty() {
+				values.insert(key.to_owned(), value.to_owned());
+			}
+		}
+	}
+
+	struct LiveResponse {
+		status: u16,
+		body: Vec<u8>,
+	}
+
+	async fn live_post(url: String, token: String, payload: Value) -> LiveResponse {
+		let client = reqwest::Client::builder()
+			.timeout(Duration::from_secs(30))
+			.redirect(reqwest::redirect::Policy::none())
+			.build()
+			.expect("live FC HTTP client must build");
+		let call = async move {
+			let mut response = client
+				.post(url)
+				.bearer_auth(token)
+				.json(&payload)
+				.send()
+				.await
+				.map_err(|_| ())?;
+			let status = response.status().as_u16();
+			let mut body = Vec::new();
+			while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+				if body.len().saturating_add(chunk.len()) > MAX_LIVE_RESPONSE_BYTES {
+					return Err(());
+				}
+				body.extend_from_slice(&chunk);
+			}
+			Ok(LiveResponse { status, body })
+		};
+		match tokio::time::timeout(Duration::from_secs(30), call).await {
+			Ok(Ok(response)) => response,
+			Ok(Err(())) | Err(_) => {
+				panic!("live FC call failed or exceeded its 30-second limit")
+			},
+		}
+	}
+
+	fn live_json(response: &LiveResponse) -> Result<Value, &'static str> {
+		serde_json::from_slice(&response.body).map_err(|_| "live FC response was not valid JSON")
+	}
+
+	fn validate_live_web_search_response(response: &LiveResponse) -> Result<(), &'static str> {
+		if response.status != 200 {
+			return Err("live Web Search returned non-200 status");
+		}
+		let body = live_json(response)?;
+		if !body.get("results").is_some_and(Value::is_array) {
+			return Err("live Web Search response omitted its results array");
+		}
+		Ok(())
+	}
+
+	#[tokio::test]
+	#[ignore = "opt-in: requires AGENTGATEWAY_LIVE_TOOLS=1 and Web Search/E2B configuration"]
+	async fn web_search_function_smoke() {
+		let Some(configuration) = LiveConfiguration::load() else {
+			return;
+		};
+		let response = live_post(
+			configuration.web_search_url,
+			configuration.web_search_token,
+			json!({"query": "Alibaba Cloud Function Compute documentation"}),
+		)
+		.await;
+		assert!(
+			validate_live_web_search_response(&response).is_ok(),
+			"live Web Search response failed fixed contract validation"
+		);
+	}
+
+	#[tokio::test]
+	#[ignore = "opt-in: creates one E2B Sandbox through the direct backend and verifies cleanup"]
+	async fn e2b_sandbox_smoke_and_cleanup() {
+		use secrecy::SecretString;
+
+		use crate::llm::tool_runtime::{
+			E2bSandboxBackend, ManagedToolCall, ToolBackend, ToolExecutionContext,
+		};
+
+		let Some(configuration) = LiveConfiguration::load() else {
+			return;
+		};
+		let backend = E2bSandboxBackend::new(
+			crate::test_helpers::policy_client(),
+			configuration
+				.e2b_api_url
+				.parse()
+				.expect("valid E2B_API_URL"),
+			configuration.e2b_domain,
+			Duration::from_secs(30),
+			SecretString::from(configuration.e2b_api_key),
+			MAX_LIVE_RESPONSE_BYTES,
+		)
+		.expect("valid direct E2B backend configuration");
+		let result = backend
+			.execute_batch(
+				vec![ManagedToolCall {
+					public_name: "code_interpreter".into(),
+					internal_name: "_agentgateway_code_interpreter".into(),
+					call_id: "task12-live-sandbox".into(),
+					arguments: json!({"code": "print(6 * 7)"}),
+					trusted_options: json!({}),
+				}],
+				ToolExecutionContext {
+					request_id: None,
+					deadline: Some(std::time::Instant::now() + Duration::from_secs(30)),
+				},
+			)
+			.await
+			.expect("direct E2B live execution must succeed")
+			.results
+			.pop()
+			.expect("direct E2B live execution returns one result")
+			.into_model_output(MAX_LIVE_RESPONSE_BYTES)
+			.expect("direct E2B live output must normalize");
+		assert_eq!(result.get("stdout").and_then(Value::as_str), Some("42\n"));
+	}
 }
 
 #[tokio::test]
@@ -1741,6 +2750,7 @@ async fn bedrock_transformed_provider_model_is_used_for_upstream_path() {
 		request: mut forwarded,
 		llm_request,
 		upstream_route_type,
+		..
 	} = provider
 		.process_completions_request(&backend_info, Some(&policy), req, false, &mut None, None)
 		.await
@@ -1801,6 +2811,7 @@ async fn bedrock_provider_model_overrides_client_model() {
 		request: mut forwarded,
 		llm_request,
 		upstream_route_type,
+		..
 	} = provider
 		.process_completions_request(&backend_info, None, req, false, &mut None, None)
 		.await
@@ -1915,6 +2926,7 @@ async fn copilot_anthropic_model_uses_messages_route() {
 		request: forwarded,
 		llm_request,
 		upstream_route_type,
+		..
 	} = provider
 		.process_messages_request(&backend_info, None, req, false, &mut None, None)
 		.await
@@ -2277,7 +3289,7 @@ async fn process_response_routes_streaming_error_to_buffered_path() {
 			None,
 			Default::default(),
 			None,
-			resp,
+			resp.into(),
 		)
 		.await
 		.expect("process_response should succeed for error responses");
@@ -2301,6 +3313,218 @@ async fn process_response_routes_streaming_error_to_buffered_path() {
 		message.contains("toolResult"),
 		"translated error should preserve the original message, got: {message}",
 	);
+}
+
+fn buffered_responses_request(model: &str) -> LLMRequest {
+	LLMRequest {
+		input_tokens: None,
+		input_format: InputFormat::Responses,
+		cache_convention: CacheTokenConvention::pending(),
+		request_model: model.into(),
+		provider: "test-provider".into(),
+		streaming: false,
+		params: Default::default(),
+		prompt: None,
+		provider_state: None,
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IntermediateRoundExtension(&'static str);
+
+#[tokio::test]
+async fn translate_buffered_responses_round_preserves_native_upstream_for_final_processing() {
+	let provider = AIProvider::OpenAI(openai::Provider {
+		model: None,
+		moderation: None,
+	});
+	let req = buffered_responses_request("gpt-4.1-mini");
+	let upstream_body = fs::read(fixture_path("response/responses/tool.json"))
+		.expect("Failed to read Responses tool-call fixture");
+	let mut upstream = ::http::Response::builder()
+		.status(::http::StatusCode::ACCEPTED)
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.header("x-upstream-round", "native-responses")
+		.header(::http::header::CONTENT_LENGTH, upstream_body.len())
+		.body(Body::from(upstream_body.clone()))
+		.unwrap();
+	upstream
+		.extensions_mut()
+		.insert(IntermediateRoundExtension("preserve-across-translation"));
+
+	let round = provider
+		.translate_buffered_responses_round(&req, RouteType::Responses, upstream)
+		.await
+		.expect("native Responses tool call should translate");
+
+	assert_eq!(round.response.id, "resp_tool");
+	assert_eq!(round.response.status, "completed");
+	let types::responses::typed::OutputItem::Message(message) = &round.response.output[0] else {
+		panic!("expected native message output before the function call");
+	};
+	assert_eq!(message.id, "msg_text");
+	let [types::responses::typed::OutputMessageContent::OutputText(text)] =
+		message.content.as_slice()
+	else {
+		panic!("expected the native message's single output-text item");
+	};
+	assert_eq!(text.text, "I will check that.");
+	let types::responses::typed::OutputItem::FunctionCall(call) = &round.response.output[1] else {
+		panic!("expected native function call output");
+	};
+	assert_eq!(call.call_id, "call_weather");
+	assert_eq!(call.name, "get_weather");
+	assert_eq!(call.arguments, r#"{"location":"San Francisco"}"#);
+
+	assert_eq!(
+		round.reconstructed_upstream.status(),
+		::http::StatusCode::ACCEPTED
+	);
+	assert_eq!(
+		round.reconstructed_upstream.headers()["x-upstream-round"],
+		"native-responses"
+	);
+	assert_eq!(
+		round.reconstructed_upstream.headers()[::http::header::CONTENT_TYPE],
+		"application/json"
+	);
+	assert!(
+		!round
+			.reconstructed_upstream
+			.headers()
+			.contains_key(::http::header::CONTENT_LENGTH)
+	);
+	assert!(
+		round
+			.reconstructed_upstream
+			.extensions()
+			.get::<crate::cel::LLMContext>()
+			.is_none(),
+		"intermediate translation must not run final response side effects"
+	);
+	assert_eq!(
+		round
+			.reconstructed_upstream
+			.extensions()
+			.get::<IntermediateRoundExtension>(),
+		Some(&IntermediateRoundExtension("preserve-across-translation")),
+		"intermediate translation must preserve arbitrary upstream response extensions"
+	);
+	let reconstructed_body = round
+		.reconstructed_upstream
+		.into_body()
+		.collect()
+		.await
+		.unwrap()
+		.to_bytes();
+	assert_eq!(reconstructed_body.as_ref(), upstream_body.as_slice());
+}
+
+#[tokio::test]
+async fn translate_buffered_responses_round_converts_openai_completions_tool_calls() {
+	// A catalog can pin a Copilot model to Completions even when its built-in heuristic would
+	// select Responses. Intermediate translation must honor the already-selected upstream route.
+	let provider = AIProvider::Copilot(copilot::Provider { model: None });
+	let req = buffered_responses_request("grok-2");
+	let upstream_body = fs::read(fixture_path("response/completions/tool_call.json"))
+		.expect("Failed to read Completions tool-call fixture");
+	let upstream = ::http::Response::builder()
+		.header("x-upstream-round", "openai-completions")
+		.body(Body::from(upstream_body.clone()))
+		.unwrap();
+
+	let round = provider
+		.translate_buffered_responses_round(&req, RouteType::Completions, upstream)
+		.await
+		.expect("OpenAI Completions tool calls should translate to Responses");
+
+	assert_eq!(round.response.status, "completed");
+	assert_eq!(round.response.output.len(), 2);
+	let types::responses::typed::OutputItem::FunctionCall(first) = &round.response.output[0] else {
+		panic!("expected first converted function call");
+	};
+	assert_eq!(first.call_id, "call_abc123");
+	assert_eq!(first.name, "get_weather");
+	let types::responses::typed::OutputItem::FunctionCall(second) = &round.response.output[1] else {
+		panic!("expected second converted function call");
+	};
+	assert_eq!(second.call_id, "call_xyz789");
+	assert_eq!(second.name, "search_web");
+	assert_eq!(
+		round.reconstructed_upstream.headers()["x-upstream-round"],
+		"openai-completions"
+	);
+	assert!(
+		round
+			.reconstructed_upstream
+			.extensions()
+			.get::<crate::cel::LLMContext>()
+			.is_none()
+	);
+	let reconstructed_body = round
+		.reconstructed_upstream
+		.into_body()
+		.collect()
+		.await
+		.unwrap()
+		.to_bytes();
+	assert_eq!(reconstructed_body.as_ref(), upstream_body.as_slice());
+}
+
+#[tokio::test]
+async fn translate_buffered_responses_round_converts_bedrock_converse_tool_calls() {
+	let provider = AIProvider::bedrock(bedrock::Provider {
+		model: Some(strng::new("anthropic.claude-3-5-sonnet-20241022-v2:0")),
+		region: strng::new("us-west-2"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+	});
+	let req = buffered_responses_request("anthropic.claude-3-5-sonnet-20241022-v2:0");
+	let upstream_body = fs::read(fixture_path("response/bedrock/tool.json"))
+		.expect("Failed to read Bedrock Converse tool-call fixture");
+	let upstream = ::http::Response::builder()
+		.header("x-upstream-round", "bedrock-converse")
+		.body(Body::from(upstream_body.clone()))
+		.unwrap();
+
+	let round = provider
+		.translate_buffered_responses_round(&req, RouteType::Responses, upstream)
+		.await
+		.expect("Bedrock Converse tool calls should translate to Responses");
+
+	assert_eq!(round.response.status, "completed");
+	assert_eq!(round.response.output.len(), 2);
+	let types::responses::typed::OutputItem::FunctionCall(first) = &round.response.output[0] else {
+		panic!("expected first Bedrock function call");
+	};
+	assert_eq!(first.call_id, "tooluse_kZJMlvQmRJ6eAyJE5GIl7Q");
+	assert_eq!(first.name, "top_song");
+	assert_eq!(first.arguments, r#"{"sign":"WZPZ"}"#);
+	let types::responses::typed::OutputItem::FunctionCall(second) = &round.response.output[1] else {
+		panic!("expected second Bedrock function call");
+	};
+	assert_eq!(second.call_id, "tooluse_kZJMlvQmRJ6eAyxxx");
+	assert_eq!(second.name, "hello");
+	assert_eq!(second.arguments, r#"{"sign":"world"}"#);
+	assert_eq!(
+		round.reconstructed_upstream.headers()["x-upstream-round"],
+		"bedrock-converse"
+	);
+	assert!(
+		round
+			.reconstructed_upstream
+			.extensions()
+			.get::<crate::cel::LLMContext>()
+			.is_none()
+	);
+	let reconstructed_body = round
+		.reconstructed_upstream
+		.into_body()
+		.collect()
+		.await
+		.unwrap()
+		.to_bytes();
+	assert_eq!(reconstructed_body.as_ref(), upstream_body.as_slice());
 }
 
 #[tokio::test]
@@ -2334,7 +3558,7 @@ async fn upstream_encoding_is_applied_after_messages_response_translation() {
 			None,
 			Default::default(),
 			None,
-			upstream,
+			upstream.into(),
 		)
 		.await
 		.unwrap();
@@ -2377,6 +3601,164 @@ async fn upstream_encoding_is_applied_after_messages_response_translation() {
 	let body: Value = serde_json::from_slice(&body).unwrap();
 	assert_eq!(body["type"], "message");
 	assert_eq!(body["policy_applied"], true);
+}
+
+async fn managed_terminal_response(client_streaming: bool) -> Response {
+	use crate::proxy::httpproxy::PolicyClient;
+	use crate::test_helpers::proxymock::setup_proxy_test;
+
+	let provider = AIProvider::OpenAI(openai::Provider {
+		model: None,
+		moderation: None,
+	});
+	let req = LLMRequest {
+		input_tokens: None,
+		input_format: InputFormat::Responses,
+		cache_convention: CacheTokenConvention::pending(),
+		request_model: "gpt-test".into(),
+		provider: "test-provider".into(),
+		streaming: client_streaming,
+		params: Default::default(),
+		prompt: None,
+		provider_state: None,
+	};
+	let typed_response = serde_json::from_value(json!({
+		"id": "resp_typed",
+		"status": "completed",
+		"model": "gpt-test",
+		"output": [
+			{
+				"type": "message",
+				"id": "msg_typed_0",
+				"role": "assistant",
+				"status": "completed",
+				"content": [{"type": "output_text", "text": "typed first", "annotations": []}]
+			},
+			{
+				"type": "message",
+				"id": "msg_typed_2",
+				"role": "assistant",
+				"status": "completed",
+				"content": [{"type": "output_text", "text": "typed last", "annotations": []}]
+			}
+		],
+		"tools": [{"type": "function", "name": "client_tool"}],
+		"usage": {"input_tokens": 20, "output_tokens": 22, "total_tokens": 42}
+	}))
+	.unwrap();
+	let raw_body = serde_json::to_vec(&json!({
+		"id": "resp_raw",
+		"status": "completed",
+		"model": "gpt-test",
+		"output": [{
+			"type": "message",
+			"id": "msg_raw",
+			"role": "assistant",
+			"status": "completed",
+			"content": [{"type": "output_text", "text": "raw final", "annotations": []}]
+		}],
+		"tools": [{"type": "function", "name": "_agentgateway_internal"}],
+		"usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+	}))
+	.unwrap();
+	let raw_upstream = ::http::Response::builder()
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(raw_body))
+		.unwrap();
+	let managed = tool_runtime::ManagedFinalResponse {
+		response: typed_response,
+		raw_output: vec![
+			json!({
+				"type": "message",
+				"id": "msg_raw_0",
+				"role": "assistant",
+				"status": "completed",
+				"content": [{"type": "output_text", "text": "raw first", "annotations": []}]
+			}),
+			json!({
+				"type": "future_output_item",
+				"id": "future_1",
+				"future": {"nested": [1, true, null]}
+			}),
+			json!({
+				"type": "message",
+				"id": "msg_raw_2",
+				"role": "assistant",
+				"status": "completed",
+				"content": [{"type": "output_text", "text": "raw last", "annotations": []}]
+			}),
+		],
+		raw_upstream,
+		summary: tool_runtime::ToolRuntimeSummary {
+			usage: None,
+			rounds: 2,
+			tool_calls: 1,
+			client_streaming,
+			include_obfuscation: false,
+			client_tools: None,
+		},
+	};
+
+	provider
+		.process_response(
+			PolicyClient::new(setup_proxy_test("{}").unwrap().pi),
+			req,
+			LLMResponsePolicies::default(),
+			None,
+			AsyncLog::default(),
+			llm::LogContentFields::default(),
+			None,
+			ResponseProcessingInput::Managed(Box::new(managed)),
+		)
+		.await
+		.unwrap()
+}
+
+#[tokio::test]
+async fn managed_json_terminal_round_preserves_unknown_output_item_position() {
+	let response = managed_terminal_response(false).await;
+	let body: Value = serde_json::from_slice(&response.collect().await.unwrap().to_bytes()).unwrap();
+	assert_eq!(body["output"][0]["id"], "msg_typed_0");
+	assert_eq!(body["output"][1]["type"], "future_output_item");
+	assert_eq!(
+		body["output"][1]["future"],
+		json!({"nested": [1, true, null]})
+	);
+	assert_eq!(body["output"][2]["id"], "msg_typed_2");
+	assert_eq!(body["tools"][0]["name"], "client_tool");
+	assert_eq!(body["usage"]["total_tokens"], 42);
+	assert!(!body.to_string().contains("raw first"));
+}
+
+#[tokio::test]
+async fn managed_sse_terminal_round_preserves_unknown_output_item_position() {
+	let response = managed_terminal_response(true).await;
+
+	assert_eq!(
+		response.headers()[::http::header::CONTENT_TYPE],
+		"text/event-stream"
+	);
+	let body = String::from_utf8(response.collect().await.unwrap().to_bytes().to_vec()).unwrap();
+	assert!(body.contains("event: response.completed\n"), "{body}");
+	assert!(body.contains("typed first"), "{body}");
+	assert!(body.contains("typed last"), "{body}");
+	assert!(body.contains("future_output_item"), "{body}");
+	assert!(body.contains("client_tool"), "{body}");
+	assert!(body.contains(r#""total_tokens":42"#), "{body}");
+	assert!(!body.contains("raw first"), "{body}");
+	assert!(!body.contains("_agentgateway_internal"), "{body}");
+	let terminal = body
+		.split("\n\n")
+		.find(|frame| frame.starts_with("event: response.completed\n"))
+		.unwrap();
+	let data = terminal
+		.lines()
+		.find_map(|line| line.strip_prefix("data: "))
+		.unwrap();
+	let event: Value = serde_json::from_str(data).unwrap();
+	assert_eq!(event["response"]["output"][0]["id"], "msg_typed_0");
+	assert_eq!(event["response"]["output"][1]["type"], "future_output_item");
+	assert_eq!(event["response"]["output"][2]["id"], "msg_typed_2");
 }
 
 #[test]

@@ -1101,6 +1101,7 @@ fn convert_backend_ai_policy(
 	});
 
 	let mut policy = llm::Policy {
+		tool_runtime: None,
 		prompt_guard: prompt_guard.transpose()?,
 		defaults: Some(
 			ai.defaults

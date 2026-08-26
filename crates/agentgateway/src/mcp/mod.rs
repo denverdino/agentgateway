@@ -10,7 +10,7 @@ mod session;
 mod sse;
 mod streamablehttp;
 mod subscriptions;
-mod upstream;
+pub(crate) mod upstream;
 
 use std::fmt::{Display, Write};
 use std::io;

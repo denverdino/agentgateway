@@ -70343,6 +70343,27 @@
 |`llm.providers[].defaults.promptCaching.cacheTools`|boolean|Add cache markers to tool definitions when supported by the provider.|
 |`llm.providers[].defaults.promptCaching.minTokens`|integer|Minimum prompt size required before cache markers are added.|
 |`llm.providers[].defaults.promptCaching.cacheMessageOffset`|integer|Message offset used when choosing where to place cache markers.|
+|`llm.toolRuntime`|object|toolRuntime configures operator-owned destinations and limits for managed Responses tools.|
+|`llm.toolRuntime.maxRounds`|integer||
+|`llm.toolRuntime.maxToolCalls`|integer||
+|`llm.toolRuntime.maxParallelToolCalls`|integer||
+|`llm.toolRuntime.totalTimeout`|string||
+|`llm.toolRuntime.maxArgumentsBytes`|integer||
+|`llm.toolRuntime.maxOutputBytes`|integer||
+|`llm.toolRuntime.tools`|[]object||
+|`llm.toolRuntime.tools[].name`|string||
+|`llm.toolRuntime.tools[].builtin`|enum|Possible values: `webSearch`, `codeInterpreter`, `null`.|
+|`llm.toolRuntime.tools[].backend`|object||
+|`llm.toolRuntime.tools[].backend.url`|string||
+|`llm.toolRuntime.tools[].backend.timeout`|string||
+|`llm.toolRuntime.tools[].backend.bearerToken`|object||
+|`llm.toolRuntime.tools[].backend.bearerToken.file`|string|Path to a file on disk to load the value from.|
+|`llm.toolRuntime.tools[].backend.type`|enum|Possible values: `functionComputeHttp`, `http`.|
+|`llm.toolRuntime.tools[].backend.apiUrl`|string||
+|`llm.toolRuntime.tools[].backend.domain`|string||
+|`llm.toolRuntime.tools[].backend.apiKey`|object||
+|`llm.toolRuntime.tools[].backend.apiKey.file`|string|Path to a file on disk to load the value from.|
+|`llm.toolRuntime.tools[].backend.type`|enum|Possible values: `e2b`.|
 |`llm.models`|[]object|models defines the set of models that can be served by this gateway. The model name refers to the<br>model in the users request that is matched; the model sent to the actual LLM can be overridden<br>on a per-model basis.|
 |`llm.models[].id`|string|id is a stable identity for this model config entry. The name field remains the model match pattern.|
 |`llm.models[].name`|string|name is the name of the model we are matching from a users request. If params.model is set, that<br>will be used in the request to the LLM provider. If not, the incoming model is used.|

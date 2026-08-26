@@ -519,6 +519,10 @@ impl LLMRequestPolicies {
 		};
 
 		Arc::new(llm::Policy {
+			tool_runtime: preferred
+				.tool_runtime
+				.clone()
+				.or_else(|| fallback.tool_runtime.clone()),
 			prompt_guard: preferred
 				.prompt_guard
 				.clone()
@@ -4331,6 +4335,73 @@ mod tests {
 		);
 		assert_eq!(policy.resolve_route("/v1/messages"), RouteType::Messages);
 		assert_eq!(policy.resolve_route("/v1/models"), RouteType::Passthrough);
+	}
+
+	#[test]
+	fn llm_policy_merge_replaces_tool_runtime_as_one_value() {
+		use crate::llm::tool_runtime::{
+			ManagedToolConfig, RuntimeLimits, ToolBackendConfig, ToolRegistry, ToolRuntimeConfig,
+		};
+
+		let tool = || ManagedToolConfig {
+			name: "managed".into(),
+			builtin: None,
+			backend: ToolBackendConfig::Http {
+				url: "http://127.0.0.1:18080".parse().unwrap(),
+				timeout: Duration::from_secs(5),
+				bearer_token: None,
+			},
+		};
+
+		let fallback_runtime = Arc::new(
+			ToolRegistry::compile(ToolRuntimeConfig {
+				limits: RuntimeLimits {
+					total_timeout: Duration::from_secs(30),
+					max_rounds: 2,
+					max_tool_calls: 3,
+					max_parallel_tool_calls: 1,
+					max_arguments_bytes: 10,
+					max_output_bytes: 20,
+				},
+				tools: vec![tool()],
+			})
+			.unwrap(),
+		);
+		let preferred_runtime = Arc::new(
+			ToolRegistry::compile(ToolRuntimeConfig {
+				limits: RuntimeLimits {
+					total_timeout: Duration::from_secs(60),
+					max_rounds: 4,
+					max_tool_calls: 5,
+					max_parallel_tool_calls: 2,
+					max_arguments_bytes: 30,
+					max_output_bytes: 40,
+				},
+				tools: vec![tool()],
+			})
+			.unwrap(),
+		);
+
+		let fallback = Arc::new(llm::Policy {
+			tool_runtime: Some(fallback_runtime.clone()),
+			..Default::default()
+		});
+		let preferred = Arc::new(llm::Policy {
+			tool_runtime: Some(preferred_runtime.clone()),
+			..Default::default()
+		});
+		let merged = LLMRequestPolicies::merge_llm_policies(&preferred, &fallback);
+		assert!(Arc::ptr_eq(
+			merged.tool_runtime.as_ref().expect("merged tool runtime"),
+			&preferred_runtime
+		));
+
+		let merged =
+			LLMRequestPolicies::merge_llm_policies(&Arc::new(llm::Policy::default()), &fallback);
+		assert!(Arc::ptr_eq(
+			merged.tool_runtime.as_ref().expect("fallback tool runtime"),
+			&fallback_runtime
+		));
 	}
 
 	#[test]

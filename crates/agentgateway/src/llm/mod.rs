@@ -7,6 +7,7 @@ use ::http::{HeaderMap, HeaderName, HeaderValue, header};
 use agent_core::prelude::Strng;
 use agent_core::strng;
 pub use agent_llm::tokenizer::{num_tokens_from_messages, preload_tokenizers};
+use agent_llm::types::responses;
 pub use agent_llm::{
 	AIError, CacheTokenConvention, ChatFormat, ContentScope, InputFormat, LLMInfo, LLMRequest,
 	LLMRequestParams, LLMResponse, LogContentFields, PromptCachingConfig, Provider, ProviderState,
@@ -35,6 +36,7 @@ pub use agent_llm::{azure, bedrock, vertex};
 
 pub mod catalog;
 pub mod policy;
+pub mod tool_runtime;
 
 use policy::streaming_guardrails::GuardedSseBody;
 pub use types::{OutputMessage, OutputMessagePart, ToolCall};
@@ -819,11 +821,12 @@ impl ChatTranslation {
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-pub enum RequestResult {
+pub(crate) enum RequestResult {
 	Success {
 		request: Request,
 		llm_request: LLMRequest,
 		upstream_route_type: RouteType,
+		tool_runtime: Option<tool_runtime::PreparedToolRuntime>,
 	},
 	Rejected(Response),
 	GuardrailRejected {
@@ -840,9 +843,149 @@ enum PreparedRequest {
 	},
 }
 
-struct BufferedResponse {
+struct PreparedChatRequest<T> {
+	request: T,
+	parts: Parts,
+	translation: &'static ChatTranslation,
+	llm_request: LLMRequest,
+}
+
+pub(crate) struct BufferedResponse {
 	parts: ::http::response::Parts,
 	bytes: Bytes,
+}
+
+pub(crate) enum ResponseProcessingInput {
+	Upstream(Response),
+	Managed(Box<tool_runtime::ManagedFinalResponse>),
+}
+
+type ManagedResponseParts = (
+	Box<responses::Response>,
+	Vec<serde_json::Value>,
+	tool_runtime::ToolRuntimeSummary,
+);
+
+impl ResponseProcessingInput {
+	pub(crate) fn raw_upstream_mut(&mut self) -> &mut Response {
+		match self {
+			Self::Upstream(response) => response,
+			Self::Managed(response) => &mut response.raw_upstream,
+		}
+	}
+
+	pub(crate) fn into_raw_upstream(self) -> Response {
+		match self {
+			Self::Upstream(response) => response,
+			Self::Managed(response) => response.raw_upstream,
+		}
+	}
+
+	fn into_parts(self) -> (Response, Option<ManagedResponseParts>) {
+		match self {
+			Self::Upstream(response) => (response, None),
+			Self::Managed(response) => {
+				let tool_runtime::ManagedFinalResponse {
+					response,
+					raw_output,
+					raw_upstream,
+					summary,
+				} = *response;
+				(
+					raw_upstream,
+					Some((Box::new(response), raw_output, summary)),
+				)
+			},
+		}
+	}
+}
+
+impl From<Response> for ResponseProcessingInput {
+	fn from(response: Response) -> Self {
+		Self::Upstream(response)
+	}
+}
+
+pub(crate) struct BufferedResponsesRound {
+	pub(crate) response: responses::Response,
+	pub(crate) raw_output: Vec<serde_json::Value>,
+	pub(crate) reconstructed_upstream: Response,
+}
+
+impl BufferedResponse {
+	pub(crate) fn status(&self) -> ::http::StatusCode {
+		self.parts.status
+	}
+
+	pub(crate) fn into_response(self) -> Response {
+		Response::from_parts(self.parts, Body::from(self.bytes))
+	}
+}
+
+fn parse_responses_round(
+	bytes: &[u8],
+) -> Result<(responses::Response, Vec<serde_json::Value>), AIError> {
+	let mut raw_response =
+		serde_json::from_slice::<serde_json::Value>(bytes).map_err(AIError::ResponseParsing)?;
+	let raw_output = raw_response
+		.get("output")
+		.and_then(serde_json::Value::as_array)
+		.cloned()
+		.ok_or_else(|| {
+			AIError::InvalidResponse(strng::literal!("Responses output was not an array"))
+		})?;
+	let mut typed_output = Vec::with_capacity(raw_output.len());
+	for item in &raw_output {
+		match serde_json::from_value::<responses::typed::OutputItem>(item.clone()) {
+			Ok(item) => typed_output.push(item),
+			Err(_error)
+				if item
+					.get("type")
+					.and_then(serde_json::Value::as_str)
+					.is_some_and(|kind| !is_known_responses_output_item_type(kind)) => {},
+			Err(error) => return Err(AIError::ResponseParsing(error)),
+		}
+	}
+	// Parse the response envelope and every known item strictly. Unknown output variants are kept
+	// only in `raw_output` so they can round-trip into the next model request without weakening the
+	// typed inspection used to select registered managed function calls.
+	raw_response["output"] = serde_json::Value::Array(Vec::new());
+	let mut response = serde_json::from_value::<responses::Response>(raw_response)
+		.map_err(AIError::ResponseParsing)?;
+	response.output = typed_output;
+	Ok((response, raw_output))
+}
+
+fn is_known_responses_output_item_type(kind: &str) -> bool {
+	matches!(
+		kind,
+		"message"
+			| "file_search_call"
+			| "function_call"
+			| "function_call_output"
+			| "web_search_call"
+			| "computer_call"
+			| "computer_call_output"
+			| "reasoning"
+			| "compaction"
+			| "image_generation_call"
+			| "code_interpreter_call"
+			| "local_shell_call"
+			| "shell_call"
+			| "shell_call_output"
+			| "apply_patch_call"
+			| "apply_patch_call_output"
+			| "mcp_call"
+			| "mcp_list_tools"
+			| "mcp_approval_request"
+			| "custom_tool_call"
+			| "custom_tool_call_output"
+			| "tool_search_call"
+			| "tool_search_output"
+			| "program"
+			| "program_output"
+			| "additional_tools"
+	)
 }
 
 // The upstream chose this representation encoding. Keep it out of the headers while the decoded
@@ -1534,7 +1677,7 @@ impl AIProvider {
 		}
 	}
 
-	pub async fn process_completions_request(
+	pub(crate) async fn process_completions_request(
 		&self,
 		backend_info: &crate::http::auth::BackendInfo,
 		policies: Option<&Policy>,
@@ -1581,7 +1724,7 @@ impl AIProvider {
 			.await
 	}
 
-	pub async fn process_messages_request(
+	pub(crate) async fn process_messages_request(
 		&self,
 		backend_info: &crate::http::auth::BackendInfo,
 		policies: Option<&Policy>,
@@ -1610,7 +1753,7 @@ impl AIProvider {
 			.await
 	}
 
-	pub async fn process_gemini_request(
+	pub(crate) async fn process_gemini_request(
 		&self,
 		backend_info: &crate::http::auth::BackendInfo,
 		policies: Option<&Policy>,
@@ -1651,7 +1794,7 @@ impl AIProvider {
 			.await
 	}
 
-	pub async fn process_embeddings_request(
+	pub(crate) async fn process_embeddings_request(
 		&self,
 		backend_info: &crate::http::auth::BackendInfo,
 		policies: Option<&Policy>,
@@ -1678,7 +1821,7 @@ impl AIProvider {
 			.await
 	}
 
-	pub async fn process_rerank_request(
+	pub(crate) async fn process_rerank_request(
 		&self,
 		backend_info: &crate::http::auth::BackendInfo,
 		policies: Option<&Policy>,
@@ -1705,7 +1848,7 @@ impl AIProvider {
 			.await
 	}
 
-	pub async fn process_responses_request(
+	pub(crate) async fn process_responses_request(
 		&self,
 		backend_info: &crate::http::auth::BackendInfo,
 		policies: Option<&Policy>,
@@ -1725,8 +1868,8 @@ impl AIProvider {
 			parts.headers.remove("session_id");
 		}
 
-		self
-			.process_chat_request(
+		let prepared = match self
+			.prepare_chat_request(
 				backend_info,
 				policies,
 				InputFormat::Responses,
@@ -1735,12 +1878,107 @@ impl AIProvider {
 				tokenize,
 				log,
 				catalog,
-				types::ChatRequest::Responses,
 			)
-			.await
+			.await?
+		{
+			Ok(prepared) => prepared,
+			Err(result) => return Ok(result),
+		};
+		let PreparedChatRequest {
+			request: mut req,
+			parts,
+			translation,
+			mut llm_request,
+		} = prepared;
+		let registry = policies.and_then(|policy| policy.tool_runtime.as_ref());
+		let tool_runtime = match tool_runtime::prepare(&mut req, registry) {
+			Ok(tool_runtime::Activation::Inactive) => None,
+			Ok(tool_runtime::Activation::Active(mut prepared)) => {
+				// Managed rounds must be buffered so tool calls can be authorized and
+				// executed before any internal output reaches the client.
+				llm_request.streaming = false;
+				let client =
+					PolicyClient::new(backend_info.inputs.clone()).with_parent_extensions(&parts.extensions);
+				let deadline = prepared.deadline;
+				if let Err(error) = prepared
+					.initialize_remote_mcp(client, &parts.extensions, deadline)
+					.await
+				{
+					return Ok(RequestResult::Rejected(error.into_openai_response()));
+				}
+				Some(prepared)
+			},
+			Err(error) => return Ok(RequestResult::Rejected(error.into_openai_response())),
+		};
+		let model_request = tool_runtime.as_ref().map_or_else(
+			|| req.clone(),
+			|prepared| prepared.canonical_request.clone(),
+		);
+		self.render_prepared_chat_request(
+			policies,
+			types::ChatRequest::Responses(model_request),
+			parts,
+			translation,
+			llm_request,
+			log,
+			tool_runtime,
+		)
 	}
 
-	pub async fn process_count_tokens_request(
+	fn responses_translation_for_route(
+		&self,
+		upstream_route_type: RouteType,
+	) -> Result<&'static ChatTranslation, AIError> {
+		CHAT_TRANSLATIONS
+			.iter()
+			.find(|translation| {
+				translation.input == InputFormat::Responses
+					&& translation.provider_format().route_type() == upstream_route_type
+					&& match self {
+						AIProvider::Bedrock(_) => translation.output == ChatFormat::BedrockConverse,
+						_ => matches!(
+							translation.output,
+							ChatFormat::OpenAICompletions | ChatFormat::OpenAIResponses
+						),
+					}
+			})
+			.ok_or_else(|| {
+				AIError::UnsupportedConversion(strng::format!(
+					"from Responses via {upstream_route_type:?} to provider {}",
+					self.provider()
+				))
+			})
+	}
+
+	/// Render one canonical managed-tool round for the already-selected provider.
+	/// This deliberately does not perform provider selection or request policies;
+	/// it only repeats the final provider rendering and request transformations.
+	pub(crate) fn rerender_responses_request(
+		&self,
+		policies: Option<&Policy>,
+		req: &responses::Request,
+		upstream_route_type: RouteType,
+		headers: &HeaderMap,
+		log: &mut Option<&mut RequestLog>,
+		llm_request: &mut LLMRequest,
+	) -> Result<Vec<u8>, AIError> {
+		let translation = self.responses_translation_for_route(upstream_route_type)?;
+		let rendered = translation.render_request(
+			types::ChatRequest::Responses(req.clone()),
+			&ChatRequestContext {
+				provider: self,
+				headers,
+				prompt_caching: policies.and_then(|policy| policy.prompt_caching.as_ref()),
+			},
+		)?;
+		llm_request.provider_state = rendered.provider_state;
+		match policies {
+			Some(policy) => policy.apply_final_transformations(rendered.body, log),
+			None => Ok(rendered.body),
+		}
+	}
+
+	pub(crate) async fn process_count_tokens_request(
 		&self,
 		backend_info: &crate::http::auth::BackendInfo,
 		req: Request,
@@ -1792,7 +2030,7 @@ impl AIProvider {
 			.await
 	}
 
-	pub async fn process_gemini_count_tokens_request(
+	pub(crate) async fn process_gemini_count_tokens_request(
 		&self,
 		backend_info: &crate::http::auth::BackendInfo,
 		policies: Option<&Policy>,
@@ -1823,7 +2061,7 @@ impl AIProvider {
 			.await
 	}
 
-	pub async fn process_detect_request(
+	pub(crate) async fn process_detect_request(
 		&self,
 		backend_info: &crate::http::auth::BackendInfo,
 		policies: Option<&Policy>,
@@ -2033,13 +2271,100 @@ impl AIProvider {
 	}
 
 	#[allow(clippy::too_many_arguments)]
+	async fn prepare_chat_request<T>(
+		&self,
+		backend_info: &crate::http::auth::BackendInfo,
+		policies: Option<&Policy>,
+		original_format: InputFormat,
+		mut request: T,
+		mut parts: Parts,
+		tokenize: bool,
+		log: &mut Option<&mut RequestLog>,
+		catalog: agent_llm::model_catalog::Catalog<'_>,
+	) -> Result<Result<PreparedChatRequest<T>, RequestResult>, AIError>
+	where
+		T: RequestType,
+	{
+		let request_model = if request.supports_model() {
+			request.model().as_deref().map(str::to_string)
+		} else {
+			None
+		};
+		let translation = self.chat_translation(original_format, request_model.as_deref(), catalog)?;
+		let provider_format = translation.provider_format();
+		let llm_request = match self
+			.prepare_request(
+				backend_info,
+				policies,
+				original_format,
+				&mut request,
+				&mut parts,
+				Some(provider_format),
+				tokenize,
+				log,
+			)
+			.await?
+		{
+			PreparedRequest::Ready(llm_request) => llm_request,
+			PreparedRequest::GuardrailRejected {
+				response,
+				guardrail,
+			} => {
+				return Ok(Err(RequestResult::GuardrailRejected {
+					response,
+					guardrail,
+				}));
+			},
+		};
+		Ok(Ok(PreparedChatRequest {
+			request,
+			parts,
+			translation,
+			llm_request,
+		}))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn render_prepared_chat_request(
+		&self,
+		policies: Option<&Policy>,
+		chat_request: types::ChatRequest,
+		mut parts: Parts,
+		translation: &'static ChatTranslation,
+		mut llm_request: LLMRequest,
+		log: &mut Option<&mut RequestLog>,
+		tool_runtime: Option<tool_runtime::PreparedToolRuntime>,
+	) -> Result<RequestResult, AIError> {
+		let rendered = translation.render_request(
+			chat_request,
+			&ChatRequestContext {
+				provider: self,
+				headers: &parts.headers,
+				prompt_caching: policies.and_then(|policy| policy.prompt_caching.as_ref()),
+			},
+		)?;
+		llm_request.provider_state = rendered.provider_state;
+		let body = match policies {
+			Some(policy) => policy.apply_final_transformations(rendered.body, log)?,
+			None => rendered.body,
+		};
+		parts.headers.remove(header::CONTENT_LENGTH);
+		Ok(RequestResult::Success {
+			request: Request::from_parts(parts, Body::from(body)),
+			llm_request,
+			upstream_route_type: translation.provider_format().route_type(),
+			tool_runtime,
+		})
+	}
+
+	#[allow(clippy::too_many_arguments)]
 	async fn process_chat_request<T, F>(
 		&self,
 		backend_info: &crate::http::auth::BackendInfo,
 		policies: Option<&Policy>,
 		original_format: InputFormat,
-		mut req: T,
-		mut parts: Parts,
+		req: T,
+		parts: Parts,
 		tokenize: bool,
 		log: &mut Option<&mut RequestLog>,
 		catalog: agent_llm::model_catalog::Catalog<'_>,
@@ -2049,59 +2374,37 @@ impl AIProvider {
 		T: RequestType,
 		F: FnOnce(T) -> types::ChatRequest,
 	{
-		let request_model = if req.supports_model() {
-			req.model().as_deref().map(str::to_string)
-		} else {
-			None
-		};
-		let chat_translation =
-			self.chat_translation(original_format, request_model.as_deref(), catalog)?;
-		let provider_format = chat_translation.provider_format();
-		let prepared = self
-			.prepare_request(
+		let prepared = match self
+			.prepare_chat_request(
 				backend_info,
 				policies,
 				original_format,
-				&mut req,
-				&mut parts,
-				Some(provider_format),
+				req,
+				parts,
 				tokenize,
 				log,
+				catalog,
 			)
-			.await?;
-		let mut llm_info = match prepared {
-			PreparedRequest::Ready(llm_info) => llm_info,
-			PreparedRequest::GuardrailRejected {
-				response,
-				guardrail,
-			} => {
-				return Ok(RequestResult::GuardrailRejected {
-					response,
-					guardrail,
-				});
-			},
+			.await?
+		{
+			Ok(prepared) => prepared,
+			Err(result) => return Ok(result),
 		};
-		let rendered = chat_translation.render_request(
-			chat_request(req),
-			&ChatRequestContext {
-				provider: self,
-				headers: &parts.headers,
-				prompt_caching: policies.and_then(|p| p.prompt_caching.as_ref()),
-			},
-		)?;
-		llm_info.provider_state = rendered.provider_state;
-		// Couldn't find a better place to apply it, needs to be after rendered. but before generating the request.
-		let body = match policies {
-			Some(p) => p.apply_final_transformations(rendered.body, log)?,
-			None => rendered.body,
-		};
-		parts.headers.remove(header::CONTENT_LENGTH);
-		let req = Request::from_parts(parts, Body::from(body));
-		Ok(RequestResult::Success {
-			request: req,
-			llm_request: llm_info,
-			upstream_route_type: provider_format.route_type(),
-		})
+		let PreparedChatRequest {
+			request,
+			parts,
+			translation,
+			llm_request,
+		} = prepared;
+		self.render_prepared_chat_request(
+			policies,
+			chat_request(request),
+			parts,
+			translation,
+			llm_request,
+			log,
+			None,
+		)
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -2183,11 +2486,12 @@ impl AIProvider {
 				Some(format) => format.route_type(),
 				None => RouteType::Detect,
 			},
+			tool_runtime: None,
 		})
 	}
 
 	#[allow(clippy::too_many_arguments)]
-	pub async fn process_response(
+	pub(crate) async fn process_response(
 		&self,
 		client: PolicyClient,
 		req: LLMRequest,
@@ -2195,24 +2499,28 @@ impl AIProvider {
 		req_snapshot: Option<Arc<RequestSnapshot>>,
 		logging: LLMLogging,
 		model_catalog: Option<&Arc<catalog::ModelCatalog>>,
-		resp: Response,
+		resp: ResponseProcessingInput,
 	) -> Result<Response, AIError> {
 		// Non-success responses are plain JSON, not event-stream data.
 		// Only enter the streaming path for successful responses; errors
 		// fall through to the buffered path where process_error translates them.
-		if req.streaming && resp.status().is_success() {
-			return self.process_streaming(
-				client,
-				req,
-				rate_limit,
-				req_snapshot,
-				logging,
-				model_catalog.cloned(),
-				resp,
-			);
-		}
+		let resp = match resp {
+			ResponseProcessingInput::Upstream(resp) if req.streaming && resp.status().is_success() => {
+				return self.process_streaming(
+					client,
+					req,
+					rate_limit,
+					req_snapshot,
+					logging,
+					model_catalog.cloned(),
+					resp,
+				);
+			},
+			resp => resp,
+		};
 		let model_catalog = model_catalog.map(Arc::as_ref);
 
+		let (resp, managed_response) = resp.into_parts();
 		let buffered = Self::buffer_response(resp).await?;
 
 		match req.input_format {
@@ -2229,19 +2537,66 @@ impl AIProvider {
 				self.process_rerank_buffered_response(req, buffered, model_catalog, &logging.response)
 			},
 			_ => {
-				self
-					.process_chat_or_detect_buffered_response(
-						client,
-						req,
-						rate_limit,
-						req_snapshot,
-						logging,
-						model_catalog,
-						buffered,
-					)
-					.await
+				Box::pin(self.process_chat_or_detect_buffered_response(
+					client,
+					req,
+					rate_limit,
+					req_snapshot,
+					logging,
+					model_catalog,
+					managed_response,
+					buffered,
+				))
+				.await
 			},
 		}
+	}
+
+	#[cfg(test)]
+	pub(crate) async fn translate_buffered_responses_round(
+		&self,
+		req: &LLMRequest,
+		upstream_route_type: RouteType,
+		resp: Response,
+	) -> Result<BufferedResponsesRound, AIError> {
+		let buffered = Self::buffer_response(resp).await?;
+		self.translate_prebuffered_responses_round(req, upstream_route_type, buffered)
+	}
+
+	pub(crate) async fn buffer_responses_round_response(
+		&self,
+		resp: Response,
+	) -> Result<BufferedResponse, AIError> {
+		Self::buffer_response(resp).await
+	}
+
+	pub(crate) fn translate_prebuffered_responses_round(
+		&self,
+		req: &LLMRequest,
+		upstream_route_type: RouteType,
+		buffered: BufferedResponse,
+	) -> Result<BufferedResponsesRound, AIError> {
+		let BufferedResponse { parts, bytes } = buffered;
+		let translation = self.responses_translation_for_route(upstream_route_type)?;
+		let translated_bytes = if translation.output == ChatFormat::OpenAIResponses {
+			bytes.clone()
+		} else {
+			let translated = translation.render_response(
+				&bytes,
+				&ChatResponseContext {
+					model: &req.request_model,
+					tool_name_map: bedrock_tool_name_map(req),
+				},
+			)?;
+			Bytes::from(translated.serialize().map_err(AIError::ResponseParsing)?)
+		};
+		let (response, raw_output) = parse_responses_round(&translated_bytes)?;
+
+		Ok(BufferedResponsesRound {
+			response,
+			raw_output,
+			reconstructed_upstream: Response::from_parts(parts, Body::from(bytes)),
+		})
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -2253,6 +2608,11 @@ impl AIProvider {
 		req_snapshot: Option<Arc<RequestSnapshot>>,
 		logging: LLMLogging,
 		model_catalog: Option<&catalog::ModelCatalog>,
+		managed_response: Option<(
+			Box<responses::Response>,
+			Vec<serde_json::Value>,
+			tool_runtime::ToolRuntimeSummary,
+		)>,
 		buffered: BufferedResponse,
 	) -> Result<Response, AIError> {
 		let LLMLogging {
@@ -2271,34 +2631,70 @@ impl AIProvider {
 			)?;
 			(LLMResponse::default(), body)
 		} else {
-			let mut resp = self.translate_chat_or_detect_response(
-				&req,
-				&bytes,
-				model_catalog.map(|c| c.as_handle()),
-			)?;
 			let prompt_guard_headers =
 				response_prompt_guard_headers(&parts.headers, rate_limit.request_traceparent.as_ref());
+			if let Some((mut resp, raw_output, summary)) = managed_response {
+				// Apply response prompt guard to the already-translated managed response.
+				if let Some(dr) = Policy::apply_response_prompt_guard(
+					&client,
+					resp.as_mut(),
+					&prompt_guard_headers,
+					&rate_limit.prompt_guard,
+					req_snapshot.as_deref(),
+					Some(&guardrail_log),
+				)
+				.await
+				.map_err(|e| {
+					warn!("failed to apply response prompt guard: {e}");
+					AIError::PromptWebhookError
+				})? {
+					return Ok(dr);
+				}
 
-			// Apply response prompt guard
-			if let Some(dr) = Policy::apply_response_prompt_guard(
-				&client,
-				resp.as_mut(),
-				&prompt_guard_headers,
-				&rate_limit.prompt_guard,
-				req_snapshot.as_deref(),
-				Some(&guardrail_log),
-			)
-			.await
-			.map_err(|e| {
-				warn!("failed to apply response prompt guard: {e}");
-				AIError::PromptWebhookError
-			})? {
-				return Ok(dr);
+				let llm_resp = resp.to_llm_response(log_content);
+				let body = if summary.client_streaming {
+					parts.headers.insert(
+						header::CONTENT_TYPE,
+						header::HeaderValue::from_static("text/event-stream"),
+					);
+					tool_runtime::encode_managed_streaming_response(
+						resp.as_ref(),
+						&raw_output,
+						summary.include_obfuscation,
+					)
+					.map_err(AIError::ResponseParsing)?
+				} else {
+					tool_runtime::serialize_managed_response(resp.as_ref(), &raw_output)
+						.map_err(AIError::ResponseParsing)?
+				};
+				(llm_resp, Bytes::from(body))
+			} else {
+				let mut resp = self.translate_chat_or_detect_response(
+					&req,
+					&bytes,
+					model_catalog.map(|c| c.as_handle()),
+				)?;
+				// Apply response prompt guard.
+				if let Some(dr) = Policy::apply_response_prompt_guard(
+					&client,
+					resp.as_mut(),
+					&prompt_guard_headers,
+					&rate_limit.prompt_guard,
+					req_snapshot.as_deref(),
+					Some(&guardrail_log),
+				)
+				.await
+				.map_err(|e| {
+					warn!("failed to apply response prompt guard: {e}");
+					AIError::PromptWebhookError
+				})? {
+					return Ok(dr);
+				}
+
+				let llm_resp = resp.to_llm_response(log_content);
+				let body = resp.serialize().map_err(AIError::ResponseParsing)?;
+				(llm_resp, Bytes::copy_from_slice(&body))
 			}
-
-			let llm_resp = resp.to_llm_response(log_content);
-			let body = resp.serialize().map_err(AIError::ResponseParsing)?;
-			(llm_resp, Bytes::copy_from_slice(&body))
 		};
 
 		parts.headers.remove(header::CONTENT_LENGTH);

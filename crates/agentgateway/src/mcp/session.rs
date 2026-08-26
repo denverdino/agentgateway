@@ -18,7 +18,7 @@ use rmcp::model::{
 	ServerJsonRpcMessage,
 };
 use rmcp::transport::common::http_header::{EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE};
-use sse_stream::{KeepAlive, Sse, SseBody, SseStream};
+use sse_stream::{KeepAlive, Sse, SseBody};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::http::Response;
@@ -324,11 +324,13 @@ impl Session {
 		let sse = match content_type {
 			Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
 				trace!("forward SSE got SSE stream response");
+				let limit = crate::http::response_buffer_limit(&resp);
 				let content_encoding = resp.headers().typed_get::<headers::ContentEncoding>();
-				let (body, _encoding) =
-					crate::http::compression::decompress_body(resp.into_body(), content_encoding.as_ref())
-						.map_err(ClientError::new)?;
-				let event_stream = SseStream::from_bytes_stream(body.into_data_stream()).boxed();
+				let event_stream = crate::mcp::streamablehttp::bounded_sse_stream(
+					resp.into_body(),
+					content_encoding.as_ref(),
+					limit,
+				)?;
 				StreamableHttpPostResponse::Sse(event_stream, None)
 			},
 			Some(ct) if ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {

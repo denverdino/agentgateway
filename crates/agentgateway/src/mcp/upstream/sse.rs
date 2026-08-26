@@ -8,12 +8,12 @@ use rmcp::model::{
 	ClientJsonRpcMessage, ClientNotification, ClientRequest, JsonRpcRequest, ServerJsonRpcMessage,
 };
 use rmcp::transport::common::http_header::EVENT_STREAM_MIME_TYPE;
-use sse_stream::{Sse, SseStream};
+use sse_stream::Sse;
 
 use crate::client::ResolvedDestination;
 use crate::mcp::ClientError;
 use crate::mcp::mergestream::Messages;
-use crate::mcp::streamablehttp::StreamableHttpPostResponse;
+use crate::mcp::streamablehttp::{StreamableHttpPostResponse, bounded_sse_stream};
 use crate::mcp::upstream::stdio::Process;
 use crate::mcp::upstream::{IncomingRequestContext, UpstreamError};
 use crate::*;
@@ -129,11 +129,9 @@ impl ClientCore {
 
 		match content_type {
 			Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
+				let limit = crate::http::response_buffer_limit(&resp);
 				let content_encoding = resp.headers().typed_get::<headers::ContentEncoding>();
-				let (body, _encoding) =
-					crate::http::compression::decompress_body(resp.into_body(), content_encoding.as_ref())
-						.map_err(ClientError::new)?;
-				let event_stream = SseStream::from_bytes_stream(body.into_data_stream()).boxed();
+				let event_stream = bounded_sse_stream(resp.into_body(), content_encoding.as_ref(), limit)?;
 				Ok(StreamableHttpPostResponse::Sse(event_stream, None))
 			},
 			_ => Err(ClientError::new(anyhow!(

@@ -2219,6 +2219,302 @@ async fn build_simple_backend_call(
 	Ok((backend_call, maybe_inference))
 }
 
+#[derive(Clone)]
+struct ResponsesRoundRequestTemplate {
+	method: ::http::Method,
+	uri: Uri,
+	version: ::http::Version,
+	headers: HeaderMap,
+	extensions: ::http::Extensions,
+}
+
+impl ResponsesRoundRequestTemplate {
+	fn from_request(req: &Request) -> Self {
+		Self {
+			method: req.method().clone(),
+			uri: req.uri().clone(),
+			version: req.version(),
+			headers: req.headers().clone(),
+			extensions: req.extensions().clone(),
+		}
+	}
+
+	fn build(&self, body: Vec<u8>) -> Result<Request, ProxyError> {
+		let mut req = ::http::Request::builder()
+			.method(self.method.clone())
+			.uri(self.uri.clone())
+			.version(self.version)
+			.body(http::Body::from(body))?;
+		*req.headers_mut() = self.headers.clone();
+		*req.extensions_mut() = self.extensions.clone();
+		req.headers_mut().remove(header::CONTENT_LENGTH);
+		Ok(req)
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ManagedToolRuntimeHandled;
+
+fn accumulate_upstream_duration(
+	current: &mut Option<std::time::Duration>,
+	elapsed: std::time::Duration,
+) {
+	*current = Some(current.unwrap_or_default().saturating_add(elapsed));
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_pinned_upstream(
+	inputs: &Arc<ProxyInputs>,
+	req: Request,
+	target: &Target,
+	connection: &client::ConnectionConfig,
+	span_target: Option<&Strng>,
+	outbound_labels: &OutboundCallLabels,
+	log: &mut Option<&mut RequestLog>,
+) -> Result<Response, ProxyError> {
+	dtrace::snapshot!(Request, "final request", &req);
+	let request_body_limit = crate::http::buffer_limit(&req);
+	let req =
+		req.map(|body| dtrace::TracingBody::maybe_wrap("final request", body, request_body_limit));
+	let mut call = client::Call {
+		req,
+		target: target.clone(),
+		connection: connection.clone(),
+	};
+	dtrace::trace(|trace| trace.backend_call_started(&call.target));
+	let mut span = log.as_ref().and_then(|log| {
+		let writer = log.span_writer();
+		writer.is_enabled().then(|| {
+			let mut span = Box::new(writer.start_outbound(*outbound_labels));
+			let method = call.req.method().as_str().to_owned();
+			span.rename_span(match span_target {
+				Some(target) => format!("{method} {target}"),
+				None => method.clone(),
+			});
+			span.add_attribute(KeyValue::new("http.method", method));
+			if let Some(host) = call.req.uri().host() {
+				span.add_attribute(KeyValue::new("http.host", host.to_owned()));
+			}
+			span.add_attribute(KeyValue::new(
+				"http.path",
+				http::get_path_and_query(call.req.uri()).to_owned(),
+			));
+			span.inject_context(&mut call.req);
+			span
+		})
+	});
+	let outbound_start = std::time::Instant::now();
+	log.add(|log| {
+		if log.request_processing_duration.is_none() {
+			log.request_processing_duration = Some(log.request_processing_start.elapsed());
+		}
+	});
+	let resp = inputs.upstream.clone().call(call).await;
+	if let Some(span) = span.as_deref_mut() {
+		match &resp {
+			Ok(response) => span.add_attribute(KeyValue::new(
+				"http.status",
+				i64::from(response.status().as_u16()),
+			)),
+			Err(error) => span.set_error(error.as_reason().to_string(), error.to_string()),
+		}
+	}
+	let outbound_end = Instant::now();
+	log.add(|log| {
+		log
+			.metrics
+			.upstream_call_duration
+			.get_or_create(outbound_labels)
+			.observe((outbound_end - outbound_start).as_secs_f64());
+		accumulate_upstream_duration(&mut log.upstream_duration, outbound_end - outbound_start);
+		if resp.is_ok() {
+			log.response_processing_start = Some(outbound_end);
+		}
+	});
+	dtrace::trace(|trace| match &resp {
+		Ok(resp) => trace.backend_call_completed(
+			Some(outbound_start),
+			Instant::now(),
+			Some(resp.status().as_u16()),
+			None,
+		),
+		Err(err) => trace.backend_call_completed(
+			Some(outbound_start),
+			Instant::now(),
+			None,
+			Some(err.to_string()),
+		),
+	});
+	resp
+}
+
+struct PinnedResponsesRoundTrip<'a, 'log> {
+	inputs: &'a Arc<ProxyInputs>,
+	backend_info: &'a auth::BackendInfo,
+	backend_call: &'a BackendCall,
+	llm_request_policies: &'a store::LLMRequestPolicies,
+	llm: &'a llm::NamedAIProvider,
+	template: &'a ResponsesRoundRequestTemplate,
+	upstream_route_type: RouteType,
+	llm_request: &'a mut LLMRequest,
+	first_request: Option<Request>,
+	connection: &'a client::ConnectionConfig,
+	outbound_labels: &'a OutboundCallLabels,
+	log: &'a mut Option<&'log mut RequestLog>,
+}
+
+#[async_trait::async_trait]
+impl llm::tool_runtime::runner::ResponsesRoundTrip for PinnedResponsesRoundTrip<'_, '_> {
+	async fn execute_round(
+		&mut self,
+		canonical_request: &llm::types::responses::Request,
+		_remaining: Duration,
+	) -> Result<llm::tool_runtime::runner::ModelRound, llm::tool_runtime::ToolRuntimeError> {
+		let request = if let Some(request) = self.first_request.take() {
+			request
+		} else {
+			let body = self
+				.llm
+				.provider
+				.rerender_responses_request(
+					self.llm_request_policies.llm.as_deref(),
+					canonical_request,
+					self.upstream_route_type,
+					&self.template.headers,
+					self.log,
+					self.llm_request,
+				)
+				.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+			let mut request = self
+				.template
+				.build(body)
+				.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+			if let Some(auth) = self.backend_call.backend_policies.backend_auth.as_ref() {
+				auth::apply_backend_auth(self.backend_info, auth, &mut request)
+					.await
+					.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+			}
+			self
+				.llm
+				.provider
+				.setup_request(
+					&mut request,
+					self.upstream_route_type,
+					Some(self.llm_request),
+					self.llm.path_override.as_deref(),
+					self.llm.path_prefix.as_deref(),
+					self.llm.host_override.is_some(),
+				)
+				.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+			self.llm.provider.strip_browser_cors_headers(&mut request);
+			apply_auto_hostname(&mut request, &self.backend_call.target)
+				.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+			auth::apply_late_backend_auth(
+				self.backend_call.backend_policies.backend_auth.as_ref(),
+				&mut request,
+			)
+			.await
+			.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+			request
+		};
+
+		let response = match call_pinned_upstream(
+			self.inputs,
+			request,
+			&self.backend_call.target,
+			self.connection,
+			self.backend_call.span_target.as_ref(),
+			self.outbound_labels,
+			self.log,
+		)
+		.await
+		{
+			Ok(response) => response,
+			Err(error) => {
+				return Ok(llm::tool_runtime::runner::ModelRound::InfrastructureError(
+					Box::new(error.into_response_with_grpc(false)),
+				));
+			},
+		};
+		let buffered = self
+			.llm
+			.provider
+			.buffer_responses_round_response(response)
+			.await
+			.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		if !buffered.status().is_success() {
+			return Ok(llm::tool_runtime::runner::ModelRound::UpstreamError(
+				Box::new(buffered.into_response()),
+			));
+		}
+		let round = self
+			.llm
+			.provider
+			.translate_prebuffered_responses_round(self.llm_request, self.upstream_route_type, buffered)
+			.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		Ok(llm::tool_runtime::runner::ModelRound::Success(Box::new(
+			round,
+		)))
+	}
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_managed_responses_runtime(
+	inputs: &Arc<ProxyInputs>,
+	policy_client: &PolicyClient,
+	backend_info: &auth::BackendInfo,
+	backend_call: &BackendCall,
+	llm_request_policies: &store::LLMRequestPolicies,
+	llm: &llm::NamedAIProvider,
+	runtime: Box<llm::tool_runtime::PreparedToolRuntime>,
+	template: &ResponsesRoundRequestTemplate,
+	upstream_route_type: RouteType,
+	llm_request: &mut LLMRequest,
+	request: Request,
+	connection: &client::ConnectionConfig,
+	outbound_labels: &OutboundCallLabels,
+	log: &mut Option<&mut RequestLog>,
+) -> Result<llm::ResponseProcessingInput, ProxyResponse> {
+	let mut budget = llm::tool_runtime::RuntimeBudget::new_at(
+		&runtime.registry,
+		policy_client.clone(),
+		runtime.deadline,
+	)
+	.map_err(|error| ProxyResponse::DirectResponse(Box::new(error.into_openai_response())))?;
+	budget.set_request_id(
+		log
+			.as_ref()
+			.and_then(|log| log.request_id)
+			.map(|request_id| Strng::from(request_id.to_string())),
+	);
+	let mut round_trip = PinnedResponsesRoundTrip {
+		inputs,
+		backend_info,
+		backend_call,
+		llm_request_policies,
+		llm,
+		template,
+		upstream_route_type,
+		llm_request,
+		first_request: Some(request),
+		connection,
+		outbound_labels,
+		log,
+	};
+	match llm::tool_runtime::runner::run(*runtime, budget, &mut round_trip).await {
+		Ok(result) => Ok(llm::ResponseProcessingInput::Managed(Box::new(result))),
+		Err(llm::tool_runtime::runner::RunError::UpstreamResponse(response)) => {
+			Ok(llm::ResponseProcessingInput::Upstream(*response))
+		},
+		Err(llm::tool_runtime::runner::RunError::Runtime(error)) => Err(ProxyResponse::DirectResponse(
+			Box::new(error.into_openai_response()),
+		)),
+		Err(llm::tool_runtime::runner::RunError::DirectResponse(response)) => {
+			Err(ProxyResponse::DirectResponse(response))
+		},
+	}
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn make_backend_call(
 	inputs: Arc<ProxyInputs>,
@@ -2545,7 +2841,10 @@ async fn make_backend_call(
 
 	set_backend_cel_context(&mut req, log.as_ref());
 
-	let (mut req, llm_response_policies, llm_request) =
+	let mut tool_runtime = None;
+	let mut tool_request_template = None;
+	let mut tool_upstream_route_type = None;
+	let (mut req, llm_response_policies, mut llm_request) =
 		if let Some(llm) = &backend_call.backend_policies.llm_provider {
 			// LLM requires CEL execution after the snapshot so we do not clear extensions
 			let mut req = req.take_and_snapshot_without_clearing_extensions(log.as_mut())?;
@@ -2663,12 +2962,13 @@ async fn make_backend_call(
 						.map_err(ProxyError::AIRequest)?,
 						_ => unreachable!(),
 					};
-					let (mut req, llm_request, upstream_route_type) = match r {
+					let (mut req, llm_request, upstream_route_type, prepared_tool_runtime) = match r {
 						RequestResult::Success {
 							request,
 							llm_request,
 							upstream_route_type,
-						} => (request, llm_request, upstream_route_type),
+							tool_runtime,
+						} => (request, llm_request, upstream_route_type, tool_runtime),
 						RequestResult::Rejected(dr) => return Err(ProxyResponse::DirectResponse(Box::new(dr))),
 						RequestResult::GuardrailRejected {
 							response,
@@ -2686,6 +2986,11 @@ async fn make_backend_call(
 							);
 						},
 					};
+					tool_request_template = prepared_tool_runtime
+						.as_ref()
+						.map(|_| Box::new(ResponsesRoundRequestTemplate::from_request(&req)));
+					tool_runtime = prepared_tool_runtime.map(Box::new);
+					tool_upstream_route_type = Some(upstream_route_type);
 					dtrace::trace(|trace| {
 						trace.llm_request_detected(
 							llm_provider.clone(),
@@ -2838,25 +3143,16 @@ async fn make_backend_call(
 		return Ok(resp);
 	}
 	let transport = build_backend_transport(&inputs, &backend_call, hbone_source).await?;
-	dtrace::snapshot!(Request, "final request", &req);
-	let request_body_limit = crate::http::buffer_limit(&req);
-	let req = req.map(|b| dtrace::TracingBody::maybe_wrap("final request", b, request_body_limit));
-	let mut call = client::Call {
-		req,
-		target: backend_call.target,
-		connection: client::ConnectionConfig {
-			transport,
-			tcp: backend_call.backend_policies.tcp.clone(),
-			max_connection_duration: backend_call
-				.backend_policies
-				.http
-				.as_ref()
-				.and_then(|h| h.max_connection_duration),
-		},
+	let connection = client::ConnectionConfig {
+		transport,
+		tcp: backend_call.backend_policies.tcp.clone(),
+		max_connection_duration: backend_call
+			.backend_policies
+			.http
+			.as_ref()
+			.and_then(|h| h.max_connection_duration),
 	};
-	let span_target = backend_call.span_target;
 	dtrace::trace(|trace| trace.backend_call_started(&call.target));
-	let upstream = inputs.upstream.clone();
 	let llm_logging = log.as_ref().map(|l| llm::LLMLogging {
 		response: l.llm_response.clone(),
 		guardrails: l.guardrails.clone(),
@@ -2876,83 +3172,70 @@ async fn make_backend_call(
 		kind: OutboundCallKind::Primary,
 		subtype: outbound_subtype,
 	};
-	let mut span = log.as_ref().and_then(|log| {
-		let writer = log.span_writer();
-		writer.is_enabled().then(|| {
-			let mut span = Box::new(writer.start_outbound(outbound_labels));
-			let method = call.req.method().as_str().to_owned();
-			span.rename_span(match &span_target {
-				Some(target) => format!("{method} {target}"),
-				None => method.clone(),
-			});
-			span.add_attribute(KeyValue::new("http.method", method));
-			if let Some(host) = call.req.uri().host() {
-				span.add_attribute(KeyValue::new("http.host", host.to_owned()));
-			}
-			span.add_attribute(KeyValue::new(
-				"http.path",
-				http::get_path_and_query(call.req.uri()).to_owned(),
-			));
-			span.inject_context(&mut call.req);
-			span
-		})
-	});
-	let outbound_start = std::time::Instant::now();
-	log.add(|l| {
-		if l.request_processing_duration.is_none() {
-			l.request_processing_duration = Some(l.request_processing_start.elapsed());
-		}
-	});
-	let resp = upstream.call(call).await;
-	if let Some(span) = span.as_deref_mut() {
-		match &resp {
-			Ok(response) => span.add_attribute(KeyValue::new(
-				"http.status",
-				i64::from(response.status().as_u16()),
-			)),
-			Err(error) => span.set_error(error.as_reason().to_string(), error.to_string()),
-		}
-	}
-	let outbound_end = Instant::now();
-	log.add(|l| {
-		l.metrics
-			.upstream_call_duration
-			.get_or_create(&outbound_labels)
-			.observe((outbound_end - outbound_start).as_secs_f64());
-		l.upstream_duration = Some(outbound_end - outbound_start);
-		if resp.is_ok() {
-			l.response_processing_start = Some(outbound_end);
-		}
-	});
-	dtrace::trace(|trace| match &resp {
-		Ok(resp) => trace.backend_call_completed(
-			Some(outbound_start),
-			Instant::now(),
-			Some(resp.status().as_u16()),
-			None,
-		),
-		Err(err) => trace.backend_call_completed(
-			Some(outbound_start),
-			Instant::now(),
-			None,
-			Some(err.to_string()),
-		),
-	});
-	let mut resp = resp?;
+	let (mut resp, managed_tool_runtime_handled) = if let Some(runtime) = tool_runtime {
+		let llm = backend_call
+			.backend_policies
+			.llm_provider
+			.as_ref()
+			.expect("managed Responses runtime requires an LLM provider");
+		let template = tool_request_template
+			.as_deref()
+			.expect("managed Responses runtime requires a request template");
+		let upstream_route_type =
+			tool_upstream_route_type.expect("managed Responses runtime requires a provider route");
+		let llm_request = llm_request
+			.as_mut()
+			.expect("managed Responses runtime requires request metadata");
+		let response = Box::pin(run_managed_responses_runtime(
+			&inputs,
+			&policy_client,
+			&backend_info,
+			&backend_call,
+			llm_request_policies.as_ref(),
+			llm.as_ref(),
+			runtime,
+			template,
+			upstream_route_type,
+			llm_request,
+			req,
+			&connection,
+			&outbound_labels,
+			&mut log,
+		))
+		.await?;
+		(response, true)
+	} else {
+		(
+			llm::ResponseProcessingInput::Upstream(
+				call_pinned_upstream(
+					&inputs,
+					req,
+					&backend_call.target,
+					&connection,
+					backend_call.span_target.as_ref(),
+					&outbound_labels,
+					&mut log,
+				)
+				.await?,
+			),
+			false,
+		)
+	};
 	if let Some(log) = log.as_ref() {
 		resp
+			.raw_upstream_mut()
 			.extensions_mut()
 			.insert(cel::ProxyContext::from_std_durations(
 				log.request_processing_duration,
 				log.upstream_duration,
 				log.response_processing_duration,
 			));
-		dtrace::snapshot!(Response, "raw response", log, &resp);
+		dtrace::snapshot!(Response, "raw response", log, resp.raw_upstream_mut());
 	}
 	if let Some(a2a_response) = a2a::apply_to_response(
 		backend_call.backend_policies.a2a.as_ref(),
 		a2a_type,
-		&mut resp,
+		resp.raw_upstream_mut(),
 	)
 	.await
 	.map_err(ProxyError::Processing)?
@@ -2982,7 +3265,7 @@ async fn make_backend_call(
 		.await
 		.map_err(ProxyError::AIResponse)?
 	} else {
-		resp
+		resp.into_raw_upstream()
 	};
 	// TODO: we currently do not support ImmediateResponse from inference router
 	if let Some(maybe_inference) = maybe_inference.as_mut() {
@@ -2992,6 +3275,9 @@ async fn make_backend_call(
 				.assert_size::<{ 4 * 1024 }>(),
 		)
 		.await?;
+	}
+	if managed_tool_runtime_handled {
+		resp.extensions_mut().insert(ManagedToolRuntimeHandled);
 	}
 	if let Some(log) = log.as_ref() {
 		dtrace::snapshot!(Response, "backend response ready", log, &resp);
@@ -3508,6 +3794,13 @@ fn should_retry(
 ) -> bool {
 	match res {
 		Ok(resp) => {
+			if resp
+				.extensions()
+				.get::<ManagedToolRuntimeHandled>()
+				.is_some()
+			{
+				return false;
+			}
 			if pol.codes.contains(&resp.status()) {
 				return true;
 			}
@@ -3536,18 +3829,29 @@ fn is_stale_assignment(res: &Result<Response, SnapshottedProxyResponse>) -> bool
 
 #[cfg(test)]
 mod tests {
+
 	use std::collections::{HashMap, HashSet};
 	use std::net::SocketAddr;
 	use std::sync::Arc;
+	use std::time::Duration;
 
 	use ::http::Method;
 	use serde_json::json;
 	use wiremock::{Mock, ResponseTemplate};
 
 	use super::{
-		SpiffeBackendTLS, apply_auto_hostname, apply_llm_request_policies, hop_by_hop_headers,
-		resolved_workload_target_hostname, select_service_target_port, spiffe_backend_alpns,
+		SpiffeBackendTLS, accumulate_upstream_duration, apply_auto_hostname,
+		apply_llm_request_policies, hop_by_hop_headers, resolved_workload_target_hostname,
+		select_service_target_port, spiffe_backend_alpns,
 	};
+
+	#[test]
+	fn managed_round_upstream_duration_accumulates() {
+		let mut total = None;
+		accumulate_upstream_duration(&mut total, Duration::from_millis(20));
+		accumulate_upstream_duration(&mut total, Duration::from_millis(30));
+		assert_eq!(total, Some(Duration::from_millis(50)));
+	}
 
 	#[test]
 	fn spiffe_backend_alpns_explicit_alpn_is_fixed() {

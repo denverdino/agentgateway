@@ -11417,6 +11417,17 @@
             "$ref": "#/$defs/LocalLLMProvider"
           }
         },
+        "toolRuntime": {
+          "description": "toolRuntime configures operator-owned destinations and limits for managed Responses tools.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalToolRuntimeConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "models": {
           "description": "models defines the set of models that can be served by this gateway. The model name refers to the\nmodel in the users request that is matched; the model sent to the actual LLM can be overridden\non a per-model basis.",
           "type": "array",
@@ -11802,6 +11813,168 @@
               "tls"
             ]
           }
+        }
+      ]
+    },
+    "LocalToolRuntimeConfig": {
+      "type": "object",
+      "properties": {
+        "maxRounds": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "maxToolCalls": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "maxParallelToolCalls": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "totalTimeout": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "maxArgumentsBytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "maxOutputBytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "tools": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/LocalManagedTool"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "tools"
+      ]
+    },
+    "LocalManagedTool": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "builtin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LocalBuiltinTool"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "backend": {
+          "$ref": "#/$defs/LocalToolBackend"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "backend"
+      ]
+    },
+    "LocalBuiltinTool": {
+      "type": "string",
+      "enum": [
+        "webSearch",
+        "codeInterpreter"
+      ]
+    },
+    "LocalToolBackend": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string"
+            },
+            "timeout": {
+              "type": "string"
+            },
+            "bearerToken": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/FileOrInline"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "functionComputeHttp",
+                "http"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "url",
+            "timeout"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "apiUrl": {
+              "type": "string"
+            },
+            "domain": {
+              "type": "string"
+            },
+            "timeout": {
+              "type": "string"
+            },
+            "apiKey": {
+              "$ref": "#/$defs/FileOrInline"
+            },
+            "type": {
+              "type": "string",
+              "const": "e2b"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "apiUrl",
+            "domain",
+            "timeout",
+            "apiKey"
+          ]
         }
       ]
     },

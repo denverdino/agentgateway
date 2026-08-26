@@ -1,0 +1,35 @@
+llm:
+  toolRuntime:
+    maxRounds: 8
+    maxToolCalls: 16
+    maxParallelToolCalls: 4
+    totalTimeout: 120s
+    maxArgumentsBytes: 65536
+    maxOutputBytes: 1048576
+    tools:
+    - name: web_search
+      builtin: webSearch
+      backend:
+        type: http
+        url: https://web-search.example.com
+        timeout: 15s
+        bearerToken: web-search-token
+    - name: code_interpreter
+      builtin: codeInterpreter
+      backend:
+        type: e2b
+        apiKey: e2b-test-secret
+        apiUrl: https://api.e2b.example.com
+        domain: e2b.example.com
+        timeout: 30s
+    - name: get_weather
+      backend:
+        type: http
+        url: https://weather.example.com
+        timeout: 5s
+        bearerToken: weather-token
+  models:
+  - name: test
+    provider: openAI
+    params:
+      apiKey: test-key

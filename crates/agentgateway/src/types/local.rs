@@ -423,6 +423,9 @@ pub struct LocalLLMConfig {
 	/// providers defines reusable LLM provider defaults that models may reference.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	providers: Vec<LocalLLMProvider>,
+	/// toolRuntime configures operator-owned destinations and limits for managed Responses tools.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	tool_runtime: Option<crate::llm::tool_runtime::ToolRuntimeConfig>,
 	/// models defines the set of models that can be served by this gateway. The model name refers to the
 	/// model in the users request that is matched; the model sent to the actual LLM can be overridden
 	/// on a per-model basis.
@@ -4264,10 +4267,16 @@ async fn convert_llm_config(
 		port,
 		tls,
 		providers,
+		tool_runtime,
 		models,
 		virtual_models,
 		policies,
 	} = llm_config;
+	let tool_runtime = tool_runtime
+		.map(crate::llm::tool_runtime::ToolRegistry::compile)
+		.transpose()
+		.map_err(|error| anyhow::anyhow!(error.to_string()))?
+		.map(Arc::new);
 	let port = port.unwrap_or(DEFAULT_LLM_PORT);
 	let tls = match tls {
 		Some(tls) => Some(
@@ -4511,6 +4520,7 @@ async fn convert_llm_config(
 		let prompt_guard =
 			merge_prompt_guards(shared_prompt_guard.clone(), model_config.guardrails.clone());
 		pols.push(BackendTrafficPolicy::AI(Arc::new(llm::Policy {
+			tool_runtime: tool_runtime.clone(),
 			defaults: model_config.defaults.clone(),
 			overrides: model_config.overrides.clone(),
 			transformations: model_config.transformation.clone(),

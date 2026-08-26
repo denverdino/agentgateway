@@ -472,6 +472,12 @@ impl Request {
 			RequestInput::Items(items) => items,
 		}
 	}
+
+	pub fn append_raw_input_values(&mut self, values: impl IntoIterator<Item = Value>) {
+		let mut items = self.take_input_as_items();
+		items.extend(values.into_iter().map(RawInputItem::from_value));
+		self.input = RequestInput::Items(items);
+	}
 }
 
 impl RequestType for Request {
@@ -1106,5 +1112,38 @@ mod tests {
 		let llm_response = response.to_llm_response(crate::LogContentFields::default());
 
 		assert!(llm_response.output_messages.is_none());
+	}
+
+	#[test]
+	fn append_raw_input_values_converts_text_to_user_item_first() {
+		let mut request: Request = serde_json::from_value(serde_json::json!({
+			"input": "hello",
+		}))
+		.unwrap();
+
+		request.append_raw_input_values([
+			serde_json::json!({
+				"type": "function_call",
+				"call_id": "call_123",
+				"name": "lookup",
+				"arguments": "{}",
+			}),
+			serde_json::json!({
+				"type": "function_call_output",
+				"call_id": "call_123",
+				"output": "result",
+			}),
+		]);
+
+		let input = serde_json::to_value(&request).unwrap()["input"]
+			.as_array()
+			.unwrap()
+			.clone();
+		assert_eq!(input[0]["type"], "message");
+		assert_eq!(input[0]["role"], "user");
+		assert_eq!(input[0]["content"][0]["type"], "input_text");
+		assert_eq!(input[0]["content"][0]["text"], "hello");
+		assert_eq!(input[1]["type"], "function_call");
+		assert_eq!(input[2]["type"], "function_call_output");
 	}
 }

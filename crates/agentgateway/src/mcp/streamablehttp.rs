@@ -33,6 +33,22 @@ pub struct ServerSseMessage {
 
 type BoxedSseStream =
 	futures::stream::BoxStream<'static, Result<sse_stream::Sse, sse_stream::Error>>;
+
+pub(crate) fn bounded_sse_stream(
+	body: crate::http::Body,
+	content_encoding: Option<&headers::ContentEncoding>,
+	limit: usize,
+) -> Result<BoxedSseStream, crate::mcp::ClientError> {
+	use futures_util::StreamExt;
+
+	let (body, _encoding) = crate::http::compression::decompress_body(body, content_encoding)
+		.map_err(crate::mcp::ClientError::new)?;
+	// Limit the decompressed stream. In particular, an unterminated SSE event
+	// must not be able to grow the parser's buffer until the request deadline.
+	let body = crate::http::Body::new(http_body_util::Limited::new(body, limit));
+	Ok(sse_stream::SseStream::from_bytes_stream(body.into_data_stream()).boxed())
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum StreamableHttpPostResponse {
 	Accepted,
@@ -609,4 +625,39 @@ fn reject_modern_session_request(headers: &::http::HeaderMap) -> Result<(), Prox
 		);
 	}
 	Ok(())
+}
+
+#[cfg(test)]
+mod bounded_sse_tests {
+	use futures_util::StreamExt;
+	use headers::HeaderMapExt;
+
+	use super::bounded_sse_stream;
+
+	#[tokio::test]
+	async fn accepts_valid_event_within_decompressed_limit() {
+		let body = crate::http::Body::from("event: message\ndata: ok\n\n");
+		let mut stream = bounded_sse_stream(body, None, 64).unwrap();
+		let event = stream.next().await.unwrap().unwrap();
+		assert_eq!(event.event.as_deref(), Some("message"));
+		assert_eq!(event.data.as_deref(), Some("ok"));
+		assert!(stream.next().await.is_none());
+	}
+
+	#[tokio::test]
+	async fn rejects_compressed_unterminated_event_over_decompressed_limit() {
+		let plaintext = format!("data: {}", "x".repeat(512));
+		let compressed = crate::http::compression::encode_body(plaintext.as_bytes(), "gzip")
+			.await
+			.unwrap();
+		let mut headers = ::http::HeaderMap::new();
+		headers.insert(
+			::http::header::CONTENT_ENCODING,
+			::http::HeaderValue::from_static("gzip"),
+		);
+		let encoding = headers.typed_get::<headers::ContentEncoding>();
+		let body = crate::http::Body::from(compressed);
+		let mut stream = bounded_sse_stream(body, encoding.as_ref(), 64).unwrap();
+		assert!(stream.next().await.unwrap().is_err());
+	}
 }

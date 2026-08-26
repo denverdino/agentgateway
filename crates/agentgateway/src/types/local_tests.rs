@@ -679,6 +679,81 @@ async fn test_llm_virtual_model_conditional_config() {
 	test_config_parsing("llm_virtual_model_conditional").await;
 }
 
+#[tokio::test]
+async fn test_llm_tool_runtime_config() {
+	test_config_parsing("llm_tool_runtime").await;
+}
+
+#[tokio::test]
+async fn test_llm_tool_runtime_defaults_and_failover_share_one_runtime() {
+	let normalized = normalize_test_yaml(
+		r#"
+llm:
+  toolRuntime:
+    tools:
+    - name: get_weather
+      backend:
+        type: http
+        url: https://weather.example.com
+        timeout: 5s
+  models:
+  - name: primary
+    provider: openAI
+    params:
+      apiKey: primary-key
+  virtualModels:
+  - name: resilient
+    routing:
+      failover:
+        targets:
+        - model: primary
+          priority: 0
+"#,
+	)
+	.await
+	.expect("tool runtime config should normalize");
+
+	let mut runtimes = Vec::new();
+	for backend in &normalized.backends {
+		let Backend::AI(_, ai) = &backend.backend else {
+			continue;
+		};
+		for policy in &backend.inline_policies {
+			if let BackendTrafficPolicy::AI(policy) = policy
+				&& let Some(runtime) = &policy.tool_runtime
+			{
+				runtimes.push(runtime.clone());
+			}
+		}
+		for (provider, _) in ai.providers.iter().iter() {
+			for policy in &provider.inline_policies {
+				if let BackendTrafficPolicy::AI(policy) = policy
+					&& let Some(runtime) = &policy.tool_runtime
+				{
+					runtimes.push(runtime.clone());
+				}
+			}
+		}
+	}
+
+	assert_eq!(
+		runtimes.len(),
+		2,
+		"model and failover provider need a runtime"
+	);
+	assert!(
+		Arc::ptr_eq(&runtimes[0], &runtimes[1]),
+		"all selected backends must share the one compiled runtime"
+	);
+	let limits = &runtimes[0].limits;
+	assert_eq!(limits.max_rounds, 8);
+	assert_eq!(limits.max_tool_calls, 16);
+	assert_eq!(limits.max_parallel_tool_calls, 4);
+	assert_eq!(limits.total_timeout, std::time::Duration::from_secs(120));
+	assert_eq!(limits.max_arguments_bytes, 65_536);
+	assert_eq!(limits.max_output_bytes, 1_048_576);
+}
+
 #[test]
 fn test_llm_route_types_reuse_defaults_and_override_passthrough() {
 	let default_routes = super::llm_route_types(None);
