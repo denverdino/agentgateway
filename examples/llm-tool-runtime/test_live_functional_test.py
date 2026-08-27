@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -38,6 +40,8 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
                 "E2B_DOMAIN=sandbox.e2b.example.test\n"
                 "FC_WEATHER_MCP_URL=https://weather.example.test/mcp\n"
                 "FC_WEATHER_MCP_TOKEN=weather-mcp-token\n"
+                "OPENAI_MODEL=environment-compatible-model\n"
+                "OPENAI_BASE_URL=https://responses.example.test/v1\n"
                 "UNRELATED_SECRET=must-not-load\n",
                 encoding="utf-8",
             )
@@ -49,7 +53,10 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
             self.assertEqual(config.web_search_url, "https://search.example.test/invoke")
             self.assertEqual(config.weather_mcp_url, "https://weather.example.test/mcp")
             self.assertEqual(config.weather_mcp_token, "weather-mcp-token")
-            self.assertEqual(config.model, "qwen3.6-flash")
+            self.assertEqual(config.model, "environment-compatible-model")
+            self.assertEqual(
+                config.upstream_base_url, "https://responses.example.test/v1"
+            )
             child_environment = config.child_environment("client-token")
             self.assertEqual(child_environment["OPENAI_API_KEY"], "environment-openai")
             self.assertNotIn("UNRELATED_SECRET", child_environment)
@@ -97,6 +104,59 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
 
         self.assertEqual(self.module.extract_output_text(response), "first\nsecond")
 
+    def test_extract_programmatic_tool_codes_reads_only_generated_code_events(self) -> None:
+        logs = "\n".join(
+            (
+                '{"level":"debug","scope":"agentgateway::llm::tool_runtime::runner",'
+                '"message":"generated programmatic tool call code",'
+                '"programmatic_code":"result = tools.call(\\"weather.get_forecast\\", '
+                '{\\"q\\": \\"Shanghai\\", \\"days\\": 3})\\nprogram_output(result)"}',
+                '{"level":"debug","scope":"agentgateway::llm::tool_runtime::runner",'
+                '"message":"another event","programmatic_code":"ignored"}',
+                '{"level":"debug","scope":"agentgateway::llm::tool_runtime::runner",'
+                '"message":"generated programmatic tool call code",'
+                '"programmatic_code":""}',
+            )
+        )
+
+        self.assertEqual(
+            self.module.extract_programmatic_tool_codes(logs),
+            [
+                'result = tools.call("weather.get_forecast", '
+                '{"q": "Shanghai", "days": 3})\nprogram_output(result)'
+            ],
+        )
+
+    def test_print_case_output_includes_weather_program_code(self) -> None:
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            self.module.print_case_output(
+                "programmatic-mcp-weather",
+                "Shanghai forecast\nPROGRAMMATIC_MCP_WEATHER_3DAY_OK",
+                [
+                    'forecast = tools.call("weather.get_forecast", '
+                    '{"q": "Shanghai", "days": 3})\nprogram_output(forecast)',
+                    'program_output(tools.call("weather.get_forecast", '
+                    '{"q": "Shanghai", "days": 3}))',
+                ],
+            )
+
+        self.assertEqual(
+            output.getvalue(),
+            "PROGRAMMATIC TOOL CALL CODE 1 (Python)\n"
+            'forecast = tools.call("weather.get_forecast", '
+            '{"q": "Shanghai", "days": 3})\n'
+            "program_output(forecast)\n"
+            "END PROGRAMMATIC TOOL CALL CODE 1\n"
+            "PROGRAMMATIC TOOL CALL CODE 2 (Python)\n"
+            'program_output(tools.call("weather.get_forecast", '
+            '{"q": "Shanghai", "days": 3}))\n'
+            "END PROGRAMMATIC TOOL CALL CODE 2\n"
+            "Shanghai forecast\n"
+            "PROGRAMMATIC_MCP_WEATHER_3DAY_OK\n",
+        )
+
     def test_case_payloads_expose_both_real_backends(self) -> None:
         cases = self.module.case_payloads(
             "qwen3.6-flash",
@@ -110,6 +170,8 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
                 "web-search",
                 "code-interpreter",
                 "combined",
+                "programmatic-server-tools",
+                "programmatic-mcp-weather",
                 "streaming-tool-runtime",
                 "remote-mcp-weather",
             },
@@ -121,6 +183,41 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
         )
         self.assertTrue(cases["combined"]["parallel_tool_calls"])
         self.assertEqual(len(cases["combined"]["tools"]), 2)
+        self.assertEqual(
+            cases["programmatic-server-tools"]["tools"],
+            [
+                {"type": "web_search", "allowed_callers": ["programmatic"]},
+                {
+                    "type": "code_interpreter",
+                    "container": {"type": "auto"},
+                    "allowed_callers": ["programmatic"],
+                },
+                {"type": "programmatic_tool_calling"},
+            ],
+        )
+        weather_program = cases["programmatic-mcp-weather"]
+        self.assertEqual(
+            weather_program["tools"],
+            [
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": "https://weather.example.test/mcp",
+                    "authorization": "weather-mcp-token",
+                    "allowed_tools": ["get_forecast"],
+                    "allowed_callers": ["programmatic"],
+                    "require_approval": "never",
+                },
+                {"type": "programmatic_tool_calling"},
+            ],
+        )
+        self.assertIn("3-day", weather_program["input"])
+        self.assertIn("highest daily maximum temperature", weather_program["input"])
+        self.assertIn("lowest daily minimum temperature", weather_program["input"])
+        self.assertIn("earliest date", weather_program["input"])
+        self.assertNotIn("report each date", weather_program["input"])
+        self.assertNotIn("future 5 days", weather_program["input"])
+        self.assertIn("PROGRAMMATIC_MCP_WEATHER_3DAY_OK", weather_program["input"])
         self.assertEqual(
             cases["streaming-tool-runtime"]["tools"], [{"type": "web_search"}]
         )
@@ -154,9 +251,109 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
             "web-search",
             "code-interpreter",
             "combined",
+            "programmatic-server-tools",
+            "programmatic-mcp-weather",
             "remote-mcp-weather",
         ):
             self.assertFalse(cases[case_name]["stream"])
+
+    def test_live_case_groups_isolate_each_visible_weather_program_log(self) -> None:
+        selected = [
+            "web-search",
+            "programmatic-server-tools",
+            "programmatic-mcp-weather",
+            "streaming-tool-runtime",
+            "programmatic-mcp-weather",
+            "remote-mcp-weather",
+        ]
+
+        self.assertEqual(
+            self.module.live_case_groups(selected, show_output=True),
+            [
+                ("web-search", "programmatic-server-tools"),
+                ("programmatic-mcp-weather",),
+                ("streaming-tool-runtime",),
+                ("programmatic-mcp-weather",),
+                ("remote-mcp-weather",),
+            ],
+        )
+        self.assertEqual(
+            self.module.live_case_groups(selected, show_output=False),
+            [tuple(selected)],
+        )
+
+    def _run_programmatic_weather_case(self, output_text: str) -> str:
+        response = {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": output_text,
+                        }
+                    ],
+                }
+            ],
+        }
+        metrics = iter(
+            (
+                "",
+                'agentgateway_tool_runtime_calls_total{tool="remote_mcp",'
+                'backend="remote_mcp",outcome="success"} 1',
+            )
+        )
+        original_post_json = self.module.post_json
+        original_fetch_metrics = self.module.fetch_metrics
+        self.module.post_json = lambda *_args: (200, response)
+        self.module.fetch_metrics = lambda _port: next(metrics)
+        try:
+            return self.module.run_case(
+                "http://127.0.0.1:8080",
+                15020,
+                "client-token",
+                "programmatic-mcp-weather",
+                {"model": "test"},
+            )
+        finally:
+            self.module.post_json = original_post_json
+            self.module.fetch_metrics = original_fetch_metrics
+
+    def test_run_case_accepts_programmatic_weather_extreme_days(self) -> None:
+        text = self._run_programmatic_weather_case(
+            "Highest daily maximum temperature: 2026-08-28, 35 C\n"
+            "Lowest daily minimum temperature: 2026-08-27, 24 C\n"
+            "PROGRAMMATIC_MCP_WEATHER_3DAY_OK"
+        )
+
+        self.assertIn("2026-08-28", text)
+        self.assertIn("2026-08-27", text)
+
+    def test_run_case_accepts_programmatic_weather_listing_with_extremes(self) -> None:
+        text = self._run_programmatic_weather_case(
+            "3-day forecast for Shanghai:\n"
+            "- 2026-08-27: max 33 C, min 26.2 C\n"
+            "- 2026-08-28: max 29.9 C, min 26 C\n"
+            "- 2026-08-29: max 32.5 C, min 27.1 C\n"
+            "Highest daily maximum temperature: 33 C on 2026-08-27\n"
+            "Lowest daily minimum temperature: 26 C on 2026-08-28\n"
+            "PROGRAMMATIC_MCP_WEATHER_3DAY_OK"
+        )
+
+        self.assertIn("2026-08-29", text)
+
+    def test_run_case_rejects_programmatic_weather_daily_listing(self) -> None:
+        with self.assertRaisesRegex(
+            self.module.HarnessFailure,
+            "highest or lowest temperature day",
+        ):
+            self._run_programmatic_weather_case(
+                "2026-08-27: min 24 C, max 33 C\n"
+                "2026-08-28: min 25 C, max 35 C\n"
+                "2026-08-29: min 26 C, max 34 C\n"
+                "PROGRAMMATIC_MCP_WEATHER_3DAY_OK"
+            )
 
     def test_final_streaming_response_requires_lifecycle_delta_and_completion(self) -> None:
         response = {"status": "completed", "output": []}

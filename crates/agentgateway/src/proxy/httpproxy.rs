@@ -3152,7 +3152,7 @@ async fn make_backend_call(
 			.as_ref()
 			.and_then(|h| h.max_connection_duration),
 	};
-	dtrace::trace(|trace| trace.backend_call_started(&call.target));
+	dtrace::trace(|trace| trace.backend_call_started(&backend_call.target));
 	let llm_logging = log.as_ref().map(|l| llm::LLMLogging {
 		response: l.llm_response.clone(),
 		guardrails: l.guardrails.clone(),

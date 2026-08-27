@@ -5,8 +5,11 @@
 - Status: implemented
 - Date: 8/24/2026
 - Implementation review: 8/26/2026
+- Programmatic Tool Calling extension: approved design, implementation pending
+- Programmatic Tool Calling design review: 8/27/2026
 
-> **Note:** This document was reconciled with the current implementation on the implementation-review date above.
+> **Note:** The original managed Tool Runtime was reconciled with the current implementation on the implementation-review
+> date above. The Programmatic Tool Calling sections describe the approved follow-up implementation.
 
 ## Summary
 
@@ -41,6 +44,13 @@ bearer token. Stateless transport lets FC distribute successive protocol request
 The implementation is request-local and configured through static local YAML. It accepts `stream: true`, buffers the
 internal model/tool loop, and emits only the final canonical Response as OpenAI-compatible SSE lifecycle events.
 
+The follow-up Programmatic Tool Calling implementation accepts OpenAI-compatible `allowed_callers` and
+`programmatic_tool_calling` declarations even when the selected upstream model does not implement the native hosted
+runtime. AgentGateway asks that model for a Python program, executes it through the existing E2B Python `runCode`
+protocol, and resolves program-owned calls to Web Search, Code Interpreter, and discovered Remote
+MCP tools through the same authorized backends used for direct calls. This Python runtime is an AgentGateway extension:
+OpenAI's native Programmatic Tool Calling runtime executes JavaScript in V8.
+
 ## Background
 
 AgentGateway already had the protocol machinery needed for a model/tool loop:
@@ -69,6 +79,12 @@ for requests that select a managed tool. The existing single-call proxy path rem
 - Reuse AgentGateway's existing provider conversion, model routing, authentication, policy, and transport layers for
   every model round.
 - Reuse AgentGateway's existing outbound MCP client and proxy policy chain for remote MCP discovery and execution.
+- Accept OpenAI-compatible Programmatic Tool Calling declarations and execute model-generated Python in an E2B
+  Sandbox for upstream models without native Programmatic Tool Calling support.
+- Let generated Python invoke request-authorized Web Search, Code Interpreter, and Remote MCP tools
+  through one stable `tools.call(name, arguments)` interface.
+- Reuse the existing E2B Python context, execution, result parsing, deadline, and cleanup implementation rather than
+  adding a JavaScript runtime or a second Sandbox protocol.
 - Execute independent tool operations concurrently with a server-side bound while preserving model output order.
 - Reuse one E2B Sandbox for all Code Interpreter calls in a single model Response, while using a new Python context for
   each call and terminating the Sandbox after the batch.
@@ -93,6 +109,13 @@ for requests that select a managed tool. The existing single-call proxy path rem
 - OpenAI-managed `connector_id` MCP connectors, interactive MCP approval/resume flows, server-initiated sampling or
   elicitation, and persistent MCP sessions across Responses requests.
 - Legacy MCP HTTP/SSE transport in the initial remote MCP implementation; request-scoped MCP uses Streamable HTTP.
+- Native OpenAI JavaScript/V8 runtime equivalence. AgentGateway-managed programs are Python and intermediate `program`
+  and `program_output` items remain internal to the managed loop.
+- Parallel tool dispatch from inside one Python program in the initial Programmatic Tool Calling implementation.
+- Disabling or filtering network access from the Programmatic Tool Calling Sandbox. The E2B default network policy is
+  retained.
+- Programmatic invocation of ordinary managed `function` or `custom` tools in the initial extension. Their existing
+  direct execution path is unchanged.
 
 ## API
 
@@ -135,6 +158,37 @@ not `connector_id`. `require_approval` accepts `auto` or `never`; both execute i
 round trip. Values such as `always` and per-tool policies are rejected because Tool Runtime has no client
 approval/resume state. `authorization` is kept in redacted secret storage, is sent only to the selected MCP server as
 a bearer token, and is removed from the final response's echoed `tools` field.
+
+Programmatic Tool Calling uses the OpenAI-compatible request declarations below. `allowed_callers` is accepted on
+supported built-ins and Remote MCP declarations. Omitted `allowed_callers` is equivalent to
+`["direct"]`; `["programmatic"]` hides that tool from direct model calls; and `["direct", "programmatic"]` enables
+both routes.
+
+```json
+{
+  "model": "smart",
+  "input": "Use one program to search for AgentGateway and calculate 29 * 31.",
+  "tools": [
+    { "type": "web_search", "allowed_callers": ["programmatic"] },
+    {
+      "type": "code_interpreter",
+      "container": { "type": "auto" },
+      "allowed_callers": ["programmatic"]
+    },
+    { "type": "programmatic_tool_calling" }
+  ],
+  "stream": false
+}
+```
+
+Programmatic execution requires an operator-configured `codeInterpreter` E2B backend even when the client program
+declares only Web Search or MCP tools. The E2B backend supplies the Python runtime; declaring `code_interpreter` in the
+client request separately determines whether the generated program may invoke Code Interpreter as a nested managed
+tool.
+
+A request may declare `programmatic_tool_calling` at most once and must expose at least one eligible programmatic tool.
+One upstream response may contain either one synthetic program call or direct managed calls, but not both. These rules
+keep authorization, replay history, and synthetic `function_call_output` association unambiguous.
 
 ### Local configuration
 
@@ -182,7 +236,7 @@ The limit fields use these defaults when omitted:
 | `maxParallelToolCalls` | `4` | Maximum concurrent backend operations |
 | `totalTimeout` | `120s` | Absolute deadline for all model and tool work |
 | `maxArgumentsBytes` | `65536` | Maximum serialized arguments for one call |
-| `maxOutputBytes` | `1048576` | Runtime and backend output bound |
+| `maxOutputBytes` | `1048576` | Runtime and backend output bound; minimum `128` with code interpreter |
 
 Every limit must be greater than zero, and `maxParallelToolCalls` cannot exceed `maxToolCalls`. At least one tool is
 required. Names and built-in kinds must be unique, and configured names cannot start with `_agentgateway_`.
@@ -249,6 +303,15 @@ internal function choice after discovery. That forced choice applies only to the
 tool outputs are appended, Tool Runtime resets `tool_choice` to `auto` so the model can produce a final answer instead
 of being forced into an unbounded sequence of tool calls.
 
+When `allowed_callers` includes `programmatic`, discovery also adds the tool to a request-local programmatic catalog
+under the public name `{server_label}.{tool_name}`. A programmatic-only MCP tool is omitted from the model's direct
+function declarations. A dual-mode MCP tool appears both as its reserved internal function and in the programmatic
+catalog. After all MCP servers finish discovery, AgentGateway regenerates the synthetic program function description so
+the model sees the final tool names, descriptions, input schemas, generic MCP result shape, and failure behavior before
+it writes Python. The aggregate serialized programmatic catalog is capped at 2 MiB across all discovered servers. A
+forced MCP `tool_choice` is rejected when the selected tool is programmatic-only because that
+choice requests a direct MCP call rather than a program.
+
 When the model selects an imported function, Tool Runtime validates its arguments against the server-provided input
 schema and invokes `tools/call` with the original trusted MCP tool name. The MCP result is serialized as the matching
 `function_call_output`, and the normal model/tool loop continues. Multiple calls to the same server share one
@@ -261,6 +324,168 @@ the application validates `INGRESS_BEARER_TOKEN` before parsing JSON. Its deploy
 Function and trigger through the FC 20230330 SDK and writes only the resulting URL and ingress token to the ignored
 local `.env`.
 
+### AgentGateway-managed Programmatic Tool Calling
+
+OpenAI's native Programmatic Tool Calling runtime executes generated JavaScript in V8. AgentGateway instead implements
+an intentionally provider-independent compatibility route for upstream models without native support: the model calls
+one reserved function with generated Python, AgentGateway executes that Python through E2B, and only the final managed
+response is returned to the client. Native `program`, nested caller, fingerprint, and `program_output` items do not
+cross the client boundary in this mode.
+
+The initial AgentGateway extension supports `web_search`, `code_interpreter`, and discovered Remote MCP tools. Native
+OpenAI PTC documents MCP and Code Interpreter as programmatic-capable; AgentGateway additionally enables its managed
+Web Search mapping. Ordinary managed functions and custom tools remain direct-only in this phase.
+
+After built-in mapping and Remote MCP discovery, AgentGateway adds this strict model-facing function:
+
+```json
+{
+  "type": "function",
+  "name": "_agentgateway_programmatic_tool_calling",
+  "description": "Run one Python program in E2B. Use tools.call(name, arguments) for declared tools and program_output(value) exactly once for the final result.",
+  "strict": true,
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "code": {
+        "type": "string",
+        "description": "Python source code"
+      }
+    },
+    "required": ["code"],
+    "additionalProperties": false
+  }
+}
+```
+
+The generated program receives one stable API:
+
+```python
+value = tools.call("tool-name", {"argument": "value"})
+program_output(value)
+```
+
+Built-ins use `web_search` and `code_interpreter`, and Remote MCP tools use `{server_label}.{tool_name}`. One
+string-based API avoids Python-identifier restrictions, provides an explicit namespace for MCP name collisions, and
+keeps generated wrapper code independent of the number and kinds of discovered tools. Every call is resolved through
+the request-local catalog and existing registry, caller authorization, compiled argument schema, trusted options,
+budget, backend, and telemetry path. No destination or credential is included in the Python source or replay
+transcript.
+
+#### Record/replay protocol
+
+The program executor uses sequential record/replay because an E2B `runCode` execution cannot synchronously call back
+into the in-flight AgentGateway process:
+
+1. AgentGateway wraps the generated source with `tools.call`, `program_output`, a bounded replay transcript, and a
+   per-execution random protocol nonce.
+2. The existing E2B Python context and `/execute` path runs the wrapper in a fresh short-lived Sandbox.
+3. `tools.call` assigns a zero-based sequence number. If the transcript contains the same sequence, public tool name,
+   and canonical JSON arguments, it returns the recorded JSON output as a Python value. Internal pending/completed
+   signals inherit from `BaseException`, so ordinary generated `except Exception` handlers cannot swallow them.
+4. The first call without a replay entry raises an internal `PendingToolCall`. The wrapper emits one nonce-bound,
+   size-bounded protocol result and exits normally.
+5. AgentGateway parses the pending call, resolves and validates it, executes it through the existing backend, appends
+   its normalized result to the transcript, and runs the program again from the beginning in a new Sandbox.
+6. `program_output(value)` emits the completed program result. The executor requires exactly one final output and no
+   unresolved call.
+
+```rust
+struct ProgramReplayEntry {
+    sequence: usize,
+    public_name: Strng,
+    arguments: Value,
+    output: Value,
+}
+```
+
+Replay mismatch is a deterministic-program contract violation and terminates the managed request; it is not returned
+to the model as a retryable program error after earlier tool side effects. Each unresolved call consumes the normal
+`maxToolCalls` budget. Each replay consumes the same absolute `totalTimeout`; one successful program
+uses one Sandbox per unresolved call plus one completion pass. The request-wide upper bound is the sum of
+`maxToolCalls` and `maxRounds` Sandbox executions. Python source, wrapper input, protocol result, tool arguments, tool
+outputs, stdout, and stderr remain subject to the existing source and output bounds. The initial implementation runs
+program-owned calls sequentially and does not add `call_many` or program-internal concurrency.
+
+Python syntax/runtime failures and missing `program_output` are returned to the upstream model as one structured
+synthetic-function error so it can generate a corrected program within the remaining model-round budget. E2B creation,
+transport, deadline, or cleanup failures remain request-terminating infrastructure errors. Tool application errors are
+recorded as ordinary replay values so the Python program can inspect them; tool infrastructure failures terminate the
+request. Nested results are truncated again when necessary to fit the remaining aggregate replay budget. Before each
+nested call, the runner reserves enough space for a bounded truncation result; if no such space remains, it returns a
+`program_replay_limit` application result to the model without executing another tool or turning earlier side effects
+into a client-visible request failure.
+
+The program Sandbox uses E2B's default network behavior. AgentGateway does not configure egress rules, patch Python
+network libraries, or claim equivalence with OpenAI's no-network V8 runtime. AgentGateway still withholds all backend
+URLs, authorization values, E2B credentials, and MCP session data. Because generated Python can access the network and
+receives replayed tool results, operators must treat this mode as capable of transmitting user or tool data and must
+not treat it as a Zero Data Retention equivalent.
+
+#### Weather Remote MCP example
+
+The checked-in WeatherAPI Remote MCP server provides `get_forecast`. The live example uses only that discovered tool
+from a program and requests three days because WeatherAPI's current Free plan includes a three-day forecast according
+to its [pricing matrix](https://www.weatherapi.com/pricing.aspx):
+
+```json
+{
+  "model": "smart",
+  "input": "Use Programmatic Tool Calling to return Beijing's daily high and low temperatures for the next three forecast days, plus the highest and lowest temperature across the period. Include PROGRAMMATIC_MCP_WEATHER_3DAY_OK in the final answer.",
+  "tools": [
+    {
+      "type": "mcp",
+      "server_label": "weather",
+      "server_url": "$FC_WEATHER_MCP_URL",
+      "authorization": "$FC_WEATHER_MCP_TOKEN",
+      "allowed_tools": ["get_forecast"],
+      "require_approval": "auto",
+      "allowed_callers": ["programmatic"]
+    },
+    { "type": "programmatic_tool_calling" }
+  ],
+  "stream": false
+}
+```
+
+A valid model-generated program is:
+
+```python
+import json
+
+response = tools.call("weather.get_forecast", {
+    "q": "Beijing, China",
+    "days": 3,
+    "alerts": "no",
+    "aqi": "no",
+})
+
+text_item = next(item for item in response["content"] if item.get("type") == "text")
+weather = json.loads(text_item["text"])
+forecast_days = weather["forecast"]["forecastday"]
+if len(forecast_days) != 3:
+    raise ValueError("weather server did not return exactly three forecast days")
+
+daily = [
+    {
+        "date": item["date"],
+        "max_c": item["day"]["maxtemp_c"],
+        "min_c": item["day"]["mintemp_c"],
+    }
+    for item in forecast_days
+]
+
+program_output({
+    "location": weather["location"]["name"],
+    "daily": daily,
+    "period_high_c": max(item["max_c"] for item in daily),
+    "period_low_c": min(item["min_c"] for item in daily),
+})
+```
+
+The final program value contains exactly three daily records plus the period extrema. The following model round converts
+that reduced JSON value into the client-visible answer and preserves the exact test marker.
+
 ## Runtime Design
 
 ### Components
@@ -272,6 +497,8 @@ local `.env`.
 - `registry.rs` compiles immutable operator configuration and resolves public and internal tool names.
 - `schema.rs` compiles and validates the supported JSON Schema subset before any backend invocation.
 - `runner.rs` owns the bounded model/tool loop, round history, usage aggregation, and terminal runtime summary.
+- `program.rs` owns Python wrapper construction, nonce-bound protocol parsing, replay transcript validation, and the
+  sequential Programmatic Tool Calling state machine.
 - `mod.rs` owns request budgets, call authorization, backend grouping, concurrency, stable output ordering,
   `function_call_output` construction, and final managed-response/SSE reconstruction.
 - `backend.rs` defines normalized calls, results, application errors, infrastructure errors, and the `ToolBackend`
@@ -304,12 +531,18 @@ client POST /v1/responses
          aggregate this round's token usage
          authorize and validate all function_call items
          no calls: pass the reconstructed final response to process_response
-         calls:
+         direct calls:
            reserve call budget
            group and execute backends with bounded concurrency
            sort results back into original model-call order
            append every raw intermediate output item
            append matching function_call_output items
+         program call:
+           validate and extract generated Python
+           repeat E2B runCode with the bounded replay transcript
+           execute each pending authorized tool through its existing backend
+           stop at program_output or a bounded error
+           append the raw synthetic function call and one synthetic function_call_output
   -> replace final-round usage with aggregate usage
   -> run existing final response policies and serialization once
   -> return only the final response
@@ -324,6 +557,8 @@ shown to the model. The facade deliberately does not reuse the inbound MCP `Rout
 those components serve downstream MCP clients and implement multi-target proxy semantics that do not belong in the
 Responses loop. It does reuse `PolicyClient`, `McpHttpClient`, and the Streamable HTTP client, which preserves the
 normal outbound policy, TLS, tracing, body-limit, compression, JSON/SSE response parsing, and session-ID behavior.
+Discovery also completes the programmatic catalog before the synthetic Python function is rendered, so a generated
+program cannot name an MCP tool that was filtered, missing, invalid, or not authorized for programmatic use.
 
 Every model round uses the provider/backend selected for the first round. AgentGateway rebuilds the request, reapplies
 provider setup and backend authentication, and uses the same transport policies. When the managed runtime is active,
@@ -351,6 +586,12 @@ batch; in serial mode, intervening non-E2B calls can split them into multiple ad
 
 Fresh contexts isolate Python interpreter variables, but calls in one Sandbox still share filesystem and process state.
 A later model Response or client request creates a new Sandbox.
+
+`parallel_tool_calls` continues to govern direct model-generated calls only. A Python program pauses at its first
+unresolved `tools.call`, so program-owned calls are executed sequentially even when `parallel_tool_calls` is true. Each
+record/replay pass uses one new Sandbox through the same E2B lifecycle as a single Code Interpreter execution. Reusing
+the existing lifecycle avoids a second session abstraction and ensures cancellation and cleanup follow the established
+path; the tradeoff is one Sandbox creation per replayed program call plus one final completion pass.
 
 ### HTTP Tool backend
 
@@ -404,16 +645,24 @@ Context and execution operations are never retried. Sandbox termination accepts 
 after failure, and converts a definitive cleanup failure to a request-terminating infrastructure error even if code
 execution completed.
 
+Programmatic Tool Calling reuses this control-plane, Python-context, `/execute`, NDJSON, bound, deadline, and cleanup
+implementation. Its generated wrapper is executed as Python source and interprets the normalized stdout/stderr result
+as an internal nonce-bound program protocol. It does not add a JavaScript context, custom E2B template, persistent
+Sandbox session, or network-policy control call. Program replays and direct Code Interpreter calls remain separate E2B
+operations so existing direct-call batching semantics do not change.
+
 ### Error handling
 
 Errors are divided into three classes:
 
 - Request and limit errors return a sanitized OpenAI-compatible `400`. Examples include invalid declarations,
   unregistered or undeclared model calls, malformed arguments, schema mismatch, reserved names, unsupported active-mode
-  fields, and exhausted round/call/argument/Sandbox limits. No rejected call reaches a backend.
+  fields, invalid caller modes, replay mismatch, and exhausted round/call/argument/Sandbox limits. No rejected call
+  reaches a backend.
 - Application errors are structured tool outputs returned to the model. Examples include Python exceptions and
-  backend-declared per-call failures. They consume round and call budget, allowing the model to repair or explain the
-  result.
+  backend-declared per-call failures. A generated-program syntax/runtime failure or missing `program_output` becomes a
+  structured synthetic-function error; a nested tool application error becomes a replay value. They consume round and
+  call budget, allowing the model or program to repair or explain the result.
 - Authentication, transport, protocol, configuration, and cleanup failures terminate the request with a sanitized
   `502`. Expiration of the one absolute deadline returns `504`.
 
@@ -486,6 +735,12 @@ and other non-message items remain item lifecycle events and are retained in the
 The design does not require changes to existing provider configuration. Provider conversion must support the Responses
 function-calling shapes used in each round; all rounds remain pinned to the initially selected provider and backend.
 
+Clients opt in to AgentGateway-managed Programmatic Tool Calling with `programmatic_tool_calling` plus at least one
+tool whose `allowed_callers` includes `programmatic`. The final client response retains the original tool declarations
+but does not expose the reserved synthetic function, generated Python, replay transcript, or intermediate tool
+results. This is request-shape compatibility for models without native PTC, not native OpenAI JavaScript runtime or
+intermediate-item compatibility.
+
 ## Risks and Tradeoffs
 
 - **Gateway orchestration increases request duration and resource use.** Bounded rounds, calls, concurrency, output,
@@ -494,9 +749,22 @@ function-calling shapes used in each round; all rounds remain pinned to the init
   should make ordinary functions idempotent by `call_id` when practical.
 - **Built-ins are compatibility mappings, not native OpenAI execution.** This makes backends portable and
   operator-controlled but does not reproduce native OpenAI call-item wire types or hosted-tool behavior.
-- **One Sandbox per call would provide stronger isolation but higher startup cost.** Reusing one Sandbox per model
-  Response minimizes lifecycle overhead. Separate contexts isolate interpreter variables, while the documented shared
-  filesystem/process boundary remains.
+- **Python PTC deliberately differs from OpenAI's JavaScript runtime.** It maximizes reuse of the existing E2B
+  `runCode` path and works with upstream models that can generate Python function arguments, but code examples and
+  intermediate runtime semantics are AgentGateway-specific.
+- **Sequential replay increases Sandbox starts.** One new Sandbox per unresolved call plus one completion pass is
+  operationally simpler and preserves existing cleanup guarantees, but it has higher latency than a callback channel or
+  a persistent Program Sandbox.
+- **The Program Sandbox retains E2B's default network access.** AgentGateway does not inject backend credentials, but
+  generated Python can transmit user data or replayed tool results. Operators must account for that exposure and must
+  not infer no-egress or ZDR-equivalent behavior.
+- **MCP program results use the generic MCP result envelope.** Input schemas come from discovery, while programs may
+  need to parse text content when a server does not advertise structured output. The Weather example demonstrates that
+  explicit parsing path.
+- **For direct Code Interpreter, one Sandbox per call would provide stronger isolation but higher startup cost.**
+  Reusing one Sandbox per model Response minimizes lifecycle overhead. Separate contexts isolate interpreter variables,
+  while the documented shared filesystem/process boundary remains. Program replay deliberately uses separate Sandboxes
+  because host-side tool results are available only after each `runCode` execution ends.
 - **One Sandbox across the whole client request would improve reuse further but retain state across reasoning rounds.**
   The selected boundary is one model Response so each subsequent reasoning round receives a fresh Sandbox.
 - **Direct E2B integration couples the backend to a protocol.** It removes the operational FC Sandbox adapter and keeps
@@ -509,10 +777,15 @@ function-calling shapes used in each round; all rounds remain pinned to the init
 - **Web Search quality and availability depend on Tavily and FC.** The gateway treats the function as a bounded backend;
   provider quotas, regional deployment, and result relevance remain operational concerns.
 
-Alternatives considered were native passthrough to provider-hosted tools, a separate external agent orchestrator, a
-generic code-executing HTTP function, and one Sandbox per code call. They were not selected because they respectively
-reduce portability/operator control, move the Responses loop outside AgentGateway, weaken the purpose-built Sandbox
-boundary, or add avoidable Sandbox lifecycle overhead.
+Alternatives considered for the original direct Tool Runtime were native passthrough to provider-hosted tools, a
+separate external agent orchestrator, a generic code-executing HTTP function, and one Sandbox per direct code call.
+They were not selected because they respectively reduce portability/operator control, move the Responses loop outside
+AgentGateway, weaken the purpose-built Sandbox boundary, or add avoidable Sandbox lifecycle overhead.
+
+For the Programmatic Tool Calling extension, alternatives were a Sandbox-to-Gateway callback API and a local embedded
+Python runtime. The callback route would require a reachable request-scoped endpoint and credential protocol; the local
+runtime would add a new code-execution security boundary inside AgentGateway. Sequential E2B record/replay was selected
+because it reuses the existing backend and keeps all tool authorization in the gateway.
 
 ## Test Plan
 
@@ -524,6 +797,15 @@ boundary, or add avoidable Sandbox lifecycle overhead.
   rejection of approval-resume policies, allowed-tool filtering,
   schema import, forced tool choice translation, bearer authentication, session reuse, and tools/call execution through
   the shared `PolicyClient`/`McpHttpClient` path.
+- Unit-test `allowed_callers` on built-ins and MCP declarations; verify programmatic-only tools are
+  hidden from direct calls, dual-mode tools retain both routes, and invalid direct/programmatic caller combinations
+  fail closed.
+- Unit-test Python synthetic-function generation after MCP discovery, including bounded descriptions, public MCP names,
+  imported input schemas, generic MCP result documentation, and removal of client credentials.
+- Unit-test the program wrapper and state machine for one call, multiple sequential calls, loops, conditions, JSON
+  scalar/object/list results, deterministic replay, nonce-bound protocol parsing, Python syntax/runtime errors, missing
+  or repeated `program_output`, undeclared tools, argument schema mismatch, call limits, output limits, and deadline
+  expiration.
 - Unit-test HTTP Tool request envelopes, bearer authentication, deadline propagation, body limits, application
   errors, and sanitized transport/protocol failures.
 - Test the E2B wire protocol with local mock control and data planes: authentication headers, create response parsing,
@@ -545,6 +827,12 @@ boundary, or add avoidable Sandbox lifecycle overhead.
   for default unit or functional tests.
 - Run the opt-in live WeatherAPI MCP case through the release binary, assert its final Beijing-weather marker, and
   verify a successful `remote_mcp` metric delta.
+- Add a hermetic Programmatic MCP Weather case that discovers `get_forecast`, makes the generated Python call
+  `tools.call("weather.get_forecast", ...)`, replays a three-day provider result, and verifies three daily extrema plus
+  period extrema.
+- Add the opt-in `programmatic-mcp-weather` live case using the existing FC WeatherAPI Remote MCP server. Require
+  `PROGRAMMATIC_MCP_WEATHER_3DAY_OK`, three forecast-day high/low entries, a successful `remote_mcp` metric delta, and
+  successful E2B Sandbox operations.
 
 ## Open Questions
 
@@ -556,3 +844,7 @@ boundary, or add avoidable Sandbox lifecycle overhead.
   additional isolation and storage controls would that require?
 - Should additional hosted-tool compatibility mappings use the same reserved-function mechanism or provider-native
   execution when a selected provider supports them?
+- Should a later Programmatic Tool Calling version add `tools.call_many` or a persistent E2B Sandbox after live latency
+  data establishes that sequential record/replay is a bottleneck?
+- Should AgentGateway eventually offer an operator-controlled no-egress Program Sandbox mode in addition to the initial
+  default E2B network behavior?

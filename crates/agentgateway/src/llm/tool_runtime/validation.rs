@@ -4,13 +4,26 @@ use std::time::Duration;
 use ::http::Uri;
 
 use super::{
-	RuntimeLimits, SANDBOX_MAX_BATCH_DEADLINE, ToolBackendConfig, ToolRuntimeConfig, ToolRuntimeError,
+	BuiltinTool, RuntimeLimits, SANDBOX_MAX_BATCH_DEADLINE, ToolBackendConfig, ToolRuntimeConfig,
+	ToolRuntimeError,
 };
+
+const MIN_OUTPUT_BYTES: usize = 128;
 
 pub(super) fn validate_config(config: &ToolRuntimeConfig) -> Result<(), ToolRuntimeError> {
 	validate_limits(&config.limits)?;
 	if config.tools.is_empty() {
 		return Err(invalid("tools must contain at least one tool"));
+	}
+	if config.limits.max_output_bytes < MIN_OUTPUT_BYTES
+		&& config
+			.tools
+			.iter()
+			.any(|tool| matches!(tool.builtin, Some(BuiltinTool::CodeInterpreter)))
+	{
+		return Err(invalid(format!(
+			"maxOutputBytes must be at least {MIN_OUTPUT_BYTES} when code interpreter is configured"
+		)));
 	}
 	for tool in &config.tools {
 		match &tool.backend {

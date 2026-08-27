@@ -386,6 +386,16 @@ fn bound_output(
 	Ok(())
 }
 
+pub(crate) fn bound_replay_output(
+	output: &mut Value,
+	max_bytes: usize,
+) -> Result<(), ToolRuntimeError> {
+	let Value::Object(output) = output else {
+		return Err(ToolRuntimeError::internal());
+	};
+	bound_output(output, max_bytes, true)
+}
+
 fn serialized_len(output: &Map<String, Value>) -> usize {
 	serde_json::to_vec(output).map_or(usize::MAX, |bytes| bytes.len())
 }

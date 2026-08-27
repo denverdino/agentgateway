@@ -6,16 +6,16 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::backend::execute_sequentially;
+use super::{
+	CODE_INTERPRETER_FUNCTION, ManagedToolCall, ToolApplicationError, ToolBackend,
+	ToolBatchExecution, ToolBatchInfrastructureError, ToolExecutionContext, ToolExecutionResult,
+	ToolInfrastructureError, WEB_SEARCH_FUNCTION,
+};
 use crate::http::filters::BackendRequestTimeout;
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::metrics::{OutboundCallKind, OutboundCallSubtype};
 use crate::types::agent::{Backend, BackendTrafficPolicy, ResourceName};
-
-use super::{
-	CODE_INTERPRETER_FUNCTION, ManagedToolCall, ToolApplicationError, ToolBackend,
-	ToolBatchExecution, ToolBatchInfrastructureError, ToolExecutionContext, ToolExecutionResult,
-	ToolInfrastructureError, WEB_SEARCH_FUNCTION, backend::execute_sequentially,
-};
 
 #[derive(Clone)]
 pub struct HttpToolBackend {

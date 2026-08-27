@@ -15,6 +15,27 @@ const WEATHERAPI_BASE_PATH = "/v1";
 class ProviderFailure extends Error {}
 class ProviderResponseInvalid extends Error {}
 
+const currentWeatherOutputSchema = z.object({
+  location: z.object({
+    name: z.string(),
+  }).passthrough(),
+  current: z.object({
+    temp_c: z.number(),
+  }).passthrough(),
+}).passthrough();
+
+const forecastOutputSchema = z.object({
+  forecast: z.object({
+    forecastday: z.array(z.object({
+      date: z.string(),
+      day: z.object({
+        mintemp_c: z.number(),
+        maxtemp_c: z.number(),
+      }).passthrough(),
+    }).passthrough()),
+  }).passthrough(),
+}).passthrough();
+
 function jsonResponse(body, status = 200, headers = {}) {
   return Response.json(body, {
     status,
@@ -119,6 +140,31 @@ function providerError(error) {
   };
 }
 
+function forecastOutput(result) {
+  const forecastday = result?.forecast?.forecastday;
+  if (!Array.isArray(forecastday)) throw new ProviderResponseInvalid();
+  return {
+    forecast: {
+      forecastday: forecastday.map((entry) => {
+        const date = entry?.date;
+        const mintempC = entry?.day?.mintemp_c;
+        const maxtempC = entry?.day?.maxtemp_c;
+        if (
+          typeof date !== "string"
+          || !Number.isFinite(mintempC)
+          || !Number.isFinite(maxtempC)
+        ) {
+          throw new ProviderResponseInvalid();
+        }
+        return {
+          date,
+          day: { mintemp_c: mintempC, maxtemp_c: maxtempC },
+        };
+      }),
+    },
+  };
+}
+
 export function createMcpServer(fetchImpl, apiKey, providerTimeoutMs = PROVIDER_TIMEOUT_MS) {
   const server = new McpServer(
     { name: "weatherapi-mcp-fc", version: "1.0.0" },
@@ -131,10 +177,14 @@ export function createMcpServer(fetchImpl, apiKey, providerTimeoutMs = PROVIDER_
       q: z.string().trim().min(1).max(256).describe("City, coordinates, postcode, airport code, or IP address."),
       aqi: z.enum(["yes", "no"]).default("no"),
     },
+    outputSchema: currentWeatherOutputSchema,
   }, async ({ q, aqi }) => {
     try {
       const result = await weatherRequest(fetchImpl, apiKey, "/current.json", { q, aqi }, providerTimeoutMs);
-      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        structuredContent: result,
+      };
     } catch (error) {
       return providerError(error);
     }
@@ -148,6 +198,7 @@ export function createMcpServer(fetchImpl, apiKey, providerTimeoutMs = PROVIDER_
       alerts: z.enum(["yes", "no"]).default("no"),
       aqi: z.enum(["yes", "no"]).default("no"),
     },
+    outputSchema: forecastOutputSchema,
   }, async ({ q, days, alerts, aqi }) => {
     try {
       const result = await weatherRequest(fetchImpl, apiKey, "/forecast.json", {
@@ -156,7 +207,11 @@ export function createMcpServer(fetchImpl, apiKey, providerTimeoutMs = PROVIDER_
         alerts,
         aqi,
       }, providerTimeoutMs);
-      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+      const output = forecastOutput(result);
+      return {
+        content: [{ type: "text", text: JSON.stringify(output) }],
+        structuredContent: output,
+      };
     } catch (error) {
       return providerError(error);
     }

@@ -3705,8 +3705,7 @@ async fn managed_terminal_response(client_streaming: bool) -> Response {
 			req,
 			LLMResponsePolicies::default(),
 			None,
-			AsyncLog::default(),
-			llm::LogContentFields::default(),
+			Default::default(),
 			None,
 			ResponseProcessingInput::Managed(Box::new(managed)),
 		)

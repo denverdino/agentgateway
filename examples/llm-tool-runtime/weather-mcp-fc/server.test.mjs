@@ -96,6 +96,13 @@ test("tools/list exposes only current weather and forecast", async () => {
     ["get_current_weather", "get_forecast"],
   );
   assert.deepEqual(result.body.result.tools[0].inputSchema.required, ["q"]);
+  assert.deepEqual(result.body.result.tools[0].outputSchema.required, ["location", "current"]);
+  assert.deepEqual(result.body.result.tools[1].outputSchema.required, ["forecast"]);
+  assert.equal(
+    result.body.result.tools[1].outputSchema.properties.forecast.properties.forecastday
+      .items.properties.day.properties.mintemp_c.type,
+    "number",
+  );
 });
 
 test("get_current_weather calls only the fixed WeatherAPI origin", async () => {
@@ -125,6 +132,46 @@ test("get_current_weather calls only the fixed WeatherAPI origin", async () => {
     location: { name: "Beijing" },
     current: { temp_c: 28 },
   });
+  assert.deepEqual(result.body.result.structuredContent, {
+    location: { name: "Beijing" },
+    current: { temp_c: 28 },
+  });
+});
+
+test("get_forecast returns structured content matching its advertised output schema", async () => {
+  const providerForecast = {
+    location: { name: "Shanghai" },
+    current: { temp_c: 31 },
+    forecast: {
+      forecastday: [{
+        date: "2026-08-27",
+        day: { mintemp_c: 26.2, maxtemp_c: 33, avgtemp_c: 29.6 },
+        hour: [{ time: "2026-08-27 00:00", temp_c: 28 }],
+      }],
+    },
+  };
+  const response = await handler(async () => Response.json(providerForecast))(mcpRequest({
+    jsonrpc: "2.0",
+    id: 4,
+    method: "tools/call",
+    params: {
+      name: "get_forecast",
+      arguments: { q: "Shanghai", days: 3 },
+    },
+  }));
+
+  const result = await json(response);
+  assert.equal(result.status, 200);
+  const expected = {
+    forecast: {
+      forecastday: [{
+        date: "2026-08-27",
+        day: { mintemp_c: 26.2, maxtemp_c: 33 },
+      }],
+    },
+  };
+  assert.deepEqual(result.body.result.structuredContent, expected);
+  assert.deepEqual(JSON.parse(result.body.result.content[0].text), expected);
 });
 
 test("get_forecast validates days before calling WeatherAPI", async () => {

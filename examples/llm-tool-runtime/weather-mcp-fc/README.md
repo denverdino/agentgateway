@@ -9,6 +9,11 @@ The initial server exposes only `get_current_weather` and `get_forecast`. It
 listens on `0.0.0.0:${CAPort:-9000}` and serves authenticated `POST /mcp` plus
 unauthenticated `GET /healthz`. Every MCP request gets a fresh stateless SDK
 transport, so Function Compute does not need session affinity.
+Both tools advertise an MCP `outputSchema` and return matching
+`structuredContent`, while retaining JSON text content for clients that do not
+consume structured MCP results. Forecast responses project the provider payload
+to each date's minimum and maximum temperature, avoiding replaying bulky hourly
+data through Programmatic Tool Calling.
 
 ## Authentication boundary
 

@@ -10,6 +10,7 @@ response content, code, tool output, URLs, and credentials are never printed.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import socket
@@ -28,6 +29,7 @@ from typing import Any, DefaultDict, Dict, Iterable, List, Mapping, Optional, Se
 
 CASE_NAMES = (
     "dual-tool-overlap",
+    "programmatic-server-tools",
     "web-search-single",
     "streaming-tool-runtime",
     "multi-code-reuse",
@@ -160,10 +162,13 @@ class MockState:
     def record_model(self, scenario: str, request: Dict[str, Any]) -> None:
         with self.lock:
             self.model_requests[scenario].append(request)
-            if scenario in {"dual-tool-overlap", "multi-code-reuse"} and not has_function_output(
-                request
-            ):
-                self.pending_sandbox_scenarios.append(scenario)
+            if scenario in {
+                "dual-tool-overlap",
+                "programmatic-server-tools",
+                "multi-code-reuse",
+            } and not has_function_output(request):
+                count = 4 if scenario == "programmatic-server-tools" else 1
+                self.pending_sandbox_scenarios.extend([scenario] * count)
 
     def record_web(self, scenario: str, request: Dict[str, Any]) -> None:
         with self.lock:
@@ -175,9 +180,11 @@ class MockState:
             scenario = self.pending_sandbox_scenarios.pop(0)
             require(self.active_sandbox_scenario is None, "E2B Sandbox lifecycles overlapped")
             self.active_sandbox_scenario = scenario
-            sandbox_id = (
-                "functional-dual" if scenario == "dual-tool-overlap" else "functional-multi"
-            )
+            sandbox_id = {
+                "dual-tool-overlap": "functional-dual",
+                "programmatic-server-tools": "functional-programmatic",
+                "multi-code-reuse": "functional-multi",
+            }[scenario]
             return scenario, sandbox_id
 
     def active_sandbox(self) -> str:
@@ -191,10 +198,12 @@ class MockState:
     def next_context(self, scenario: str) -> str:
         with self.lock:
             self.context_counts[scenario] += 1
-            return "{}-context-{}".format(
-                "dual" if scenario == "dual-tool-overlap" else "multi",
-                self.context_counts[scenario],
-            )
+            prefix = {
+                "dual-tool-overlap": "dual",
+                "programmatic-server-tools": "programmatic",
+                "multi-code-reuse": "multi",
+            }[scenario]
+            return "{}-context-{}".format(prefix, self.context_counts[scenario])
 
     def finish_sandbox(self, scenario: str) -> None:
         with self.lock:
@@ -240,6 +249,7 @@ def detect_model_scenario(payload: Mapping[str, Any]) -> str:
     for scenario, marker in (
         ("startup-auth-probe", "functional-startup-auth-probe"),
         ("dual-tool-overlap", "functional-dual"),
+        ("programmatic-server-tools", "functional-programmatic"),
         ("web-search-single", "functional-web-only"),
         ("multi-code-reuse", "functional-multi-code"),
     ):
@@ -269,6 +279,35 @@ def model_response(scenario: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
             ),
         ]
         return response_body("resp_dual_intermediate", output, 10, 4)
+    if scenario == "programmatic-server-tools":
+        if continuation:
+            return response_body(
+                "resp_programmatic_final",
+                [message("msg_programmatic_final", "programmatic final answer")],
+                4,
+                2,
+            )
+        return response_body(
+            "resp_programmatic_calls",
+            [
+                function_call(
+                    "_agentgateway_programmatic_tool_calling",
+                    "programmatic-program-1",
+                    {
+                        "code": (
+                            "fact = tools.call('web_search', "
+                            "{'query': 'functional programmatic search'})\n"
+                            "calculation = tools.call('code_interpreter', "
+                            "{'code': 'print(29 * 31)'})\n"
+                            "program_output({'fact': fact, 'calculation': calculation, "
+                            "'product': 899})"
+                        )
+                    },
+                ),
+            ],
+            10,
+            5,
+        )
     if scenario == "web-search-single":
         if continuation:
             return response_body(
@@ -401,6 +440,9 @@ class WebSearchHandler(QuietHandler):
             if query == "functional dual search":
                 scenario = "dual-tool-overlap"
                 delay = 0.7
+            elif query == "functional programmatic search":
+                scenario = "programmatic-server-tools"
+                delay = 0.01
             elif query == "functional web only":
                 scenario = "web-search-single"
                 delay = 0.01
@@ -514,13 +556,61 @@ class SandboxHandler(QuietHandler):
                 context_id = request.get("context_id")
                 require(isinstance(request.get("code"), str), "E2B execute omitted wrapped code")
                 require(request.get("language") is None, "E2B execute selected an untrusted language")
-                require(request.get("env_vars") is None, "E2B execute forwarded untrusted env vars")
                 if scenario == "dual-tool-overlap":
+                    require(request.get("env_vars") is None, "direct E2B received env vars")
                     require(context_id == "dual-context-1", "dual E2B context ID changed")
                     stdout = "42\n"
+                elif scenario == "programmatic-server-tools":
+                    env_vars = request.get("env_vars")
+                    if env_vars is None:
+                        require(
+                            context_id == "programmatic-context-3",
+                            "nested Code Interpreter context ID changed",
+                        )
+                        stdout = "899\n"
+                    else:
+                        require(isinstance(env_vars, dict), "program env_vars were not an object")
+                        nonce = env_vars.get("AGENTGATEWAY_PTC_NONCE")
+                        replay_encoded = env_vars.get("AGENTGATEWAY_PTC_REPLAY")
+                        require(isinstance(nonce, str), "program nonce was absent")
+                        require(isinstance(replay_encoded, str), "program replay was absent")
+                        replay = json.loads(base64.b64decode(replay_encoded))
+                        require(isinstance(replay, list), "program replay was not an array")
+                        if len(replay) == 0:
+                            outcome = {
+                                "version": 1,
+                                "kind": "pending",
+                                "sequence": 0,
+                                "name": "web_search",
+                                "arguments": {"query": "functional programmatic search"},
+                            }
+                        elif len(replay) == 1:
+                            outcome = {
+                                "version": 1,
+                                "kind": "pending",
+                                "sequence": 1,
+                                "name": "code_interpreter",
+                                "arguments": {"code": "print(29 * 31)"},
+                            }
+                        elif len(replay) == 2:
+                            outcome = {
+                                "version": 1,
+                                "kind": "completed",
+                                "output": {
+                                    "fact": "bounded functional snippet",
+                                    "product": 899,
+                                },
+                            }
+                        else:
+                            raise HarnessFailure("program replay length changed")
+                        payload = json.dumps(outcome, separators=(",", ":")).encode("utf-8")
+                        frame = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+                        stdout = "__AGENTGATEWAY_PTC_V1__{}:{}\n".format(nonce, frame)
                 elif context_id == "multi-context-1":
+                    require(request.get("env_vars") is None, "direct E2B received env vars")
                     stdout = "set\n"
                 elif context_id == "multi-context-2":
+                    require(request.get("env_vars") is None, "direct E2B received env vars")
                     stdout = "isolated\n"
                 else:
                     raise HarnessFailure("E2B execute received unknown context")
@@ -546,9 +636,11 @@ class SandboxHandler(QuietHandler):
                 state.record_sandbox(scenario, "DELETE", self.path)
                 self.send_empty(204)
                 return
-            expected_id = (
-                "functional-dual" if scenario == "dual-tool-overlap" else "functional-multi"
-            )
+            expected_id = {
+                "dual-tool-overlap": "functional-dual",
+                "programmatic-server-tools": "functional-programmatic",
+                "multi-code-reuse": "functional-multi",
+            }[scenario]
             require(self.path == "/sandboxes/" + expected_id, "E2B kill targeted wrong Sandbox")
             self.require_control_auth()
             state.record_sandbox(scenario, "DELETE", self.path)
@@ -948,6 +1040,122 @@ class FunctionalCases:
             "each delayed backend did not observe its peer before completion",
         )
 
+    def programmatic_server_tools(self) -> None:
+        with self.state.lock:
+            web_before = len(self.state.web_requests)
+            sandbox_before = len(self.state.sandbox_requests)
+        status, body = self.request(
+            {
+                "model": "smart",
+                "input": "functional-programmatic: search and calculate in one program",
+                "tools": [
+                    {"type": "web_search", "allowed_callers": ["programmatic"]},
+                    {
+                        "type": "code_interpreter",
+                        "container": {"type": "auto"},
+                        "allowed_callers": ["programmatic"],
+                    },
+                    {"type": "programmatic_tool_calling"},
+                ],
+                "parallel_tool_calls": True,
+                "stream": False,
+            }
+        )
+        require(status == 200, "programmatic case did not return HTTP 200")
+        require(
+            body.get("id") == "resp_programmatic_final",
+            "programmatic case returned the wrong round",
+        )
+        require(
+            body.get("usage")
+            == {"input_tokens": 14, "output_tokens": 7, "total_tokens": 21},
+            "programmatic aggregate usage was incorrect",
+        )
+        output = body.get("output")
+        require(
+            isinstance(output, list)
+            and len(output) == 1
+            and output[0].get("id") == "msg_programmatic_final",
+            "programmatic final response leaked intermediate output",
+        )
+
+        with self.state.lock:
+            requests = list(self.state.model_requests["programmatic-server-tools"])
+            web_count = len(self.state.web_requests) - web_before
+            sandbox_events = self.state.sandbox_requests[sandbox_before:]
+        require(len(requests) == 2, "programmatic case did not make exactly two model rounds")
+        require(web_count == 1, "programmatic case did not invoke Web Search exactly once")
+        require(
+            len(sandbox_events) == 20,
+            "programmatic case did not complete four E2B lifecycles",
+        )
+
+        mapped_tools = requests[0].get("tools")
+        require(
+            isinstance(mapped_tools, list) and len(mapped_tools) == 1,
+            "programmatic tool mapping count changed",
+        )
+        require(
+            [tool.get("type") for tool in mapped_tools] == ["function"],
+            "programmatic tool mapping order or types changed",
+        )
+        require(
+            mapped_tools[0].get("name") == "_agentgateway_programmatic_tool_calling",
+            "gateway programmatic function name changed",
+        )
+        parameters = mapped_tools[0].get("parameters")
+        require(
+            parameters
+            == {
+                "type": "object",
+                "properties": {"code": {"type": "string"}},
+                "required": ["code"],
+                "additionalProperties": False,
+            },
+            "gateway programmatic function schema changed",
+        )
+        description = mapped_tools[0].get("description")
+        require(
+            isinstance(description, str)
+            and '"name":"web_search"' in description
+            and '"name":"code_interpreter"' in description,
+            "gateway programmatic catalog omitted a server tool",
+        )
+
+        second_input = requests[1].get("input")
+        require(
+            isinstance(second_input, list) and len(second_input) == 3,
+            "programmatic function continuation history was incomplete",
+        )
+        require(
+            [item.get("type") for item in second_input]
+            == ["message", "function_call", "function_call_output"],
+            "programmatic function continuation order changed",
+        )
+        program = parse_tool_output(second_input[2])
+        require(program.get("ok") is True, "programmatic output was invalid")
+        require(
+            program.get("result")
+            == {"fact": "bounded functional snippet", "product": 899},
+            "programmatic final value was invalid",
+        )
+        expected_lifecycles = []
+        for context_index in range(1, 5):
+            expected_lifecycles.extend(
+                [
+                    ("POST", "/sandboxes"),
+                    ("POST", "/contexts"),
+                    ("POST", "/execute"),
+                    ("DELETE", "/contexts/programmatic-context-{}".format(context_index)),
+                    ("DELETE", "/sandboxes/functional-programmatic"),
+                ]
+            )
+        require(
+            [(event.get("method"), event.get("path")) for event in sandbox_events]
+            == expected_lifecycles,
+            "programmatic E2B lifecycle order changed",
+        )
+
     def web_search_single(self) -> None:
         with self.state.lock:
             web_before = len(self.state.web_requests)
@@ -1221,6 +1429,7 @@ def run_gateway_attempt(
                     cases = FunctionalCases(base_url, state)
                     methods = {
                         "dual-tool-overlap": cases.dual_tool_overlap,
+                        "programmatic-server-tools": cases.programmatic_server_tools,
                         "web-search-single": cases.web_search_single,
                         "streaming-tool-runtime": cases.streaming_tool_runtime,
                         "multi-code-reuse": cases.multi_code_reuse,

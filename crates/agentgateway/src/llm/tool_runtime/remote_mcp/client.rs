@@ -14,17 +14,16 @@ use rmcp::model::{
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Map;
 
+use super::{
+	MAX_DESCRIPTION_BYTES, MAX_DISCOVERED_TOOLS, MAX_DISCOVERY_BYTES, MAX_DISCOVERY_PAGES,
+	MAX_INPUT_SCHEMA_BYTES, MAX_OUTPUT_SCHEMA_BYTES, MAX_TOOL_NAME_BYTES,
+};
 use crate::Strng;
 use crate::http::backendtls::SYSTEM_TRUST;
 use crate::mcp::upstream::{IncomingRequestContext, McpHttpClient, McpStreamableClient, Upstream};
 use crate::proxy::httpproxy::PolicyClient;
 use crate::store::BackendPolicies;
 use crate::types::agent::{ResourceName, SimpleBackend, Target};
-
-use super::{
-	MAX_DESCRIPTION_BYTES, MAX_DISCOVERED_TOOLS, MAX_DISCOVERY_BYTES, MAX_DISCOVERY_PAGES,
-	MAX_INPUT_SCHEMA_BYTES, MAX_TOOL_NAME_BYTES,
-};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -35,6 +34,7 @@ pub(crate) struct RemoteClientTool {
 	pub name: String,
 	pub description: Option<String>,
 	pub input_schema: serde_json::Value,
+	pub output_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -176,7 +176,15 @@ impl RemoteClient {
 				let name = tool.name.into_owned();
 				let description = tool.description.map(|value| value.into_owned());
 				let input_schema = serde_json::Value::Object((*tool.input_schema).clone());
-				budget.record_tool(&name, description.as_deref(), &input_schema)?;
+				let output_schema = tool
+					.output_schema
+					.map(|schema| serde_json::Value::Object((*schema).clone()));
+				budget.record_tool(
+					&name,
+					description.as_deref(),
+					&input_schema,
+					output_schema.as_ref(),
+				)?;
 				if !discovered_names.insert(name.clone()) {
 					anyhow::bail!("remote MCP server advertised a duplicate tool name");
 				}
@@ -190,6 +198,7 @@ impl RemoteClient {
 					name,
 					description,
 					input_schema,
+					output_schema,
 				});
 			}
 			let Some(next_cursor) = page.next_cursor else {
@@ -291,6 +300,7 @@ impl DiscoveryBudget {
 		name: &str,
 		description: Option<&str>,
 		input_schema: &serde_json::Value,
+		output_schema: Option<&serde_json::Value>,
 	) -> anyhow::Result<()> {
 		self.tools = self
 			.tools
@@ -304,14 +314,19 @@ impl DiscoveryBudget {
 			anyhow::bail!("remote MCP discovery metadata limit exceeded");
 		}
 		let schema_bytes = serde_json::to_vec(input_schema)?.len();
-		if schema_bytes > MAX_INPUT_SCHEMA_BYTES {
+		let output_schema_bytes = output_schema
+			.map(serde_json::to_vec)
+			.transpose()?
+			.map_or(0, |schema| schema.len());
+		if schema_bytes > MAX_INPUT_SCHEMA_BYTES || output_schema_bytes > MAX_OUTPUT_SCHEMA_BYTES {
 			anyhow::bail!("remote MCP discovery schema limit exceeded");
 		}
 		self.add_bytes(
 			name
 				.len()
 				.saturating_add(description.map_or(0, str::len))
-				.saturating_add(schema_bytes),
+				.saturating_add(schema_bytes)
+				.saturating_add(output_schema_bytes),
 		)
 	}
 
@@ -677,19 +692,35 @@ mod tests {
 					&format!("tool_{index}"),
 					None,
 					&serde_json::json!({"type": "object"}),
+					None,
 				)
 				.unwrap();
 		}
 		assert!(
 			tools
-				.record_tool("one_too_many", None, &serde_json::json!({"type": "object"}))
+				.record_tool(
+					"one_too_many",
+					None,
+					&serde_json::json!({"type": "object"}),
+					None,
+				)
 				.is_err()
 		);
 
 		let oversized_schema = serde_json::json!({"description": "x".repeat(MAX_INPUT_SCHEMA_BYTES)});
 		assert!(
 			DiscoveryBudget::default()
-				.record_tool("large", None, &oversized_schema)
+				.record_tool("large", None, &oversized_schema, None)
+				.is_err()
+		);
+		assert!(
+			DiscoveryBudget::default()
+				.record_tool(
+					"large_output",
+					None,
+					&serde_json::json!({"type": "object"}),
+					Some(&oversized_schema),
+				)
 				.is_err()
 		);
 	}

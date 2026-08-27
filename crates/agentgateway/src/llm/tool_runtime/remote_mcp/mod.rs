@@ -7,10 +7,11 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 
 use self::client::{RemoteCallError, RemoteClient, RemoteClientTool};
+use super::backend::execute_sequentially;
 use super::{
 	ManagedToolCall, RemoteMcpServer, RuntimeDeadline, ToolApplicationError, ToolBackend,
 	ToolBatchExecution, ToolBatchInfrastructureError, ToolExecutionContext, ToolExecutionResult,
-	ToolInfrastructureError, backend::execute_sequentially,
+	ToolInfrastructureError,
 };
 use crate::proxy::httpproxy::PolicyClient;
 
@@ -18,6 +19,7 @@ pub(super) const MAX_DISCOVERED_TOOLS: usize = 128;
 pub(super) const MAX_DISCOVERY_PAGES: usize = 128;
 pub(super) const MAX_DISCOVERY_BYTES: usize = 2 * 1024 * 1024;
 pub(super) const MAX_INPUT_SCHEMA_BYTES: usize = 64 * 1024;
+pub(super) const MAX_OUTPUT_SCHEMA_BYTES: usize = 64 * 1024;
 pub(super) const MAX_TOOL_NAME_BYTES: usize = 128;
 pub(super) const MAX_DESCRIPTION_BYTES: usize = 4096;
 pub(super) const MAX_SERVER_LABEL_BYTES: usize = 128;
@@ -28,6 +30,7 @@ pub struct RemoteMcpTool {
 	pub remote_name: String,
 	pub description: Option<String>,
 	pub input_schema: Value,
+	pub output_schema: Option<Value>,
 }
 
 pub struct RemoteMcpBackend {
@@ -135,10 +138,18 @@ fn validate_tools(
 			let schema_bytes = serde_json::to_vec(&tool.input_schema)
 				.map_err(|_| ToolInfrastructureError::backend())?
 				.len();
+			let output_schema_bytes = tool
+				.output_schema
+				.as_ref()
+				.map(serde_json::to_vec)
+				.transpose()
+				.map_err(|_| ToolInfrastructureError::backend())?
+				.map_or(0, |schema| schema.len());
 			total_bytes = total_bytes
 				.checked_add(tool.name.len())
 				.and_then(|total| total.checked_add(tool.description.as_ref().map_or(0, String::len)))
 				.and_then(|total| total.checked_add(schema_bytes))
+				.and_then(|total| total.checked_add(output_schema_bytes))
 				.ok_or_else(ToolInfrastructureError::backend)?;
 			if tool.name.is_empty()
 				|| tool.name.len() > MAX_TOOL_NAME_BYTES
@@ -148,6 +159,7 @@ fn validate_tools(
 					.as_ref()
 					.is_some_and(|value| value.len() > MAX_DESCRIPTION_BYTES)
 				|| schema_bytes > MAX_INPUT_SCHEMA_BYTES
+				|| output_schema_bytes > MAX_OUTPUT_SCHEMA_BYTES
 				|| total_bytes > MAX_DISCOVERY_BYTES
 			{
 				return Err(ToolInfrastructureError::backend());
@@ -156,6 +168,7 @@ fn validate_tools(
 				remote_name: tool.name,
 				description: tool.description,
 				input_schema: tool.input_schema,
+				output_schema: tool.output_schema,
 			})
 		})
 		.collect()

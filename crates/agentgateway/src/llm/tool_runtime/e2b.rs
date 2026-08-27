@@ -5,20 +5,20 @@ use async_trait::async_trait;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
+use super::{
+	CODE_INTERPRETER_FUNCTION, ManagedToolCall, ProgramSandbox, ProgramSandboxExecution,
+	ProgramSandboxRequest, SANDBOX_MAX_BATCH_DEADLINE, SANDBOX_MAX_BATCH_EXECUTIONS,
+	SANDBOX_MAX_CALL_ID_BYTES, SANDBOX_MAX_CODE_BYTES, SandboxCleanupOutcome, SandboxOperationReport,
+	ToolApplicationError, ToolBackend, ToolBatchExecution, ToolBatchInfrastructureError,
+	ToolBatchMetadata, ToolExecutionContext, ToolExecutionResult, ToolInfrastructureError,
+	program_protocol_stdout_max_bytes,
+};
 use crate::http::filters::BackendRequestTimeout;
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::metrics::{OutboundCallKind, OutboundCallSubtype};
 use crate::types::agent::{Backend, BackendTrafficPolicy, ResourceName};
-
-use super::{
-	CODE_INTERPRETER_FUNCTION, ManagedToolCall, SANDBOX_MAX_BATCH_DEADLINE,
-	SANDBOX_MAX_BATCH_EXECUTIONS, SANDBOX_MAX_CALL_ID_BYTES, SANDBOX_MAX_CODE_BYTES,
-	SandboxCleanupOutcome, SandboxOperationReport, ToolApplicationError, ToolBackend,
-	ToolBatchExecution, ToolBatchInfrastructureError, ToolBatchMetadata, ToolExecutionContext,
-	ToolExecutionResult, ToolInfrastructureError,
-};
 
 const TEMPLATE: &str = "code-interpreter-v1";
 const PYTHON_CWD: &str = "/home/user";
@@ -28,6 +28,11 @@ const PROTOCOL_OVERHEAD: usize = 64 * 1024;
 const CLEANUP_ATTEMPTS: usize = 2;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
+
+struct PythonSource {
+	code: String,
+	env_vars: Option<Map<String, Value>>,
+}
 
 #[derive(Clone)]
 pub struct E2bSandboxBackend {
@@ -113,6 +118,40 @@ impl E2bSandboxBackend {
 			return Ok(ToolBatchExecution::new(Vec::new()));
 		}
 		self.validate_calls(&calls)?;
+		let sources = calls
+			.into_iter()
+			.map(|call| PythonSource {
+				code: call.arguments["code"]
+					.as_str()
+					.expect("validated code argument")
+					.to_owned(),
+				env_vars: None,
+			})
+			.collect();
+		self
+			.execute_python_sources(sources, context, self.max_response_bytes)
+			.await
+	}
+
+	async fn execute_python_sources(
+		&self,
+		sources: Vec<PythonSource>,
+		context: ToolExecutionContext,
+		max_output_bytes: usize,
+	) -> Result<ToolBatchExecution, ToolBatchInfrastructureError> {
+		if sources.is_empty() || sources.len() > SANDBOX_MAX_BATCH_EXECUTIONS {
+			return Err(ToolInfrastructureError::configuration().into());
+		}
+		for source in &sources {
+			if source.code.len() > SANDBOX_MAX_CODE_BYTES
+				|| source.env_vars.as_ref().is_some_and(|env_vars| {
+					serde_json::to_vec(env_vars)
+						.map(|value| value.len() > self.max_response_bytes.saturating_mul(2))
+						.unwrap_or(true)
+				}) {
+				return Err(ToolInfrastructureError::configuration().into());
+			}
+		}
 		let deadline = context.deadline.map_or_else(
 			|| Instant::now() + self.timeout,
 			|value| value.min(Instant::now() + self.timeout),
@@ -149,12 +188,12 @@ impl E2bSandboxBackend {
 		metadata.sandbox_create = Some(operation_report(true, create_started));
 
 		let execute_started = Instant::now();
-		let mut remaining_output = self.max_response_bytes;
-		let mut results = Vec::with_capacity(calls.len());
+		let mut remaining_output = max_output_bytes;
+		let mut results = Vec::with_capacity(sources.len());
 		let mut execution_error = None;
-		for call in &calls {
+		for source in &sources {
 			match self
-				.execute_call(&sandbox, call, operation_deadline, remaining_output)
+				.execute_source(&sandbox, source, operation_deadline, remaining_output)
 				.await
 			{
 				Ok(result) => {
@@ -211,10 +250,10 @@ impl E2bSandboxBackend {
 		Ok(sandbox)
 	}
 
-	async fn execute_call(
+	async fn execute_source(
 		&self,
 		sandbox: &Sandbox,
-		call: &ManagedToolCall,
+		source: &PythonSource,
 		deadline: Instant,
 		max_output_bytes: usize,
 	) -> Result<ToolExecutionResult, ToolInfrastructureError> {
@@ -242,10 +281,7 @@ impl E2bSandboxBackend {
 			return Err(ToolInfrastructureError::backend());
 		}
 
-		let code = call.arguments["code"]
-			.as_str()
-			.expect("validated code argument");
-		let (wrapped, truncation_marker) = bounded_python_source(code, max_output_bytes);
+		let (wrapped, truncation_marker) = bounded_python_source(&source.code, max_output_bytes);
 		let execution = self
 			.request(
 				Method::POST,
@@ -254,7 +290,7 @@ impl E2bSandboxBackend {
 					"code": wrapped,
 					"context_id": context.id,
 					"language": Value::Null,
-					"env_vars": Value::Null
+					"env_vars": source.env_vars
 				})),
 				headers,
 				max_output_bytes.saturating_add(PROTOCOL_OVERHEAD),
@@ -488,6 +524,37 @@ impl ToolBackend for E2bSandboxBackend {
 		context: ToolExecutionContext,
 	) -> Result<ToolBatchExecution, ToolBatchInfrastructureError> {
 		self.execute_batch_inner(calls, context).await
+	}
+}
+
+#[async_trait]
+impl ProgramSandbox for E2bSandboxBackend {
+	async fn run(
+		&self,
+		request: ProgramSandboxRequest,
+		context: ToolExecutionContext,
+	) -> Result<ProgramSandboxExecution, ToolBatchInfrastructureError> {
+		let execution = self
+			.execute_python_sources(
+				vec![PythonSource {
+					code: request.source,
+					env_vars: Some(request.env_vars),
+				}],
+				context,
+				program_protocol_stdout_max_bytes(self.max_response_bytes),
+			)
+			.await?;
+		let ToolBatchExecution {
+			mut results,
+			metadata,
+		} = execution;
+		let Some(result) = results.pop() else {
+			return Err(ToolBatchInfrastructureError::new(
+				ToolInfrastructureError::internal(),
+				metadata,
+			));
+		};
+		Ok(ProgramSandboxExecution { result, metadata })
 	}
 }
 

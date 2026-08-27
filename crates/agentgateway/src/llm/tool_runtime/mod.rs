@@ -5,6 +5,7 @@ mod config;
 mod e2b;
 mod http_backend;
 mod mapper;
+mod program;
 mod registry;
 mod remote_mcp;
 pub(crate) mod runner;
@@ -16,20 +17,35 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use backend::ToolBackend;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use agent_core::prelude::Strng;
+use agent_llm::types::responses;
 pub(crate) use backend::{
 	ManagedToolCall, SandboxCleanupOutcome, SandboxOperationReport, ToolApplicationError,
-	ToolBatchExecution, ToolBatchInfrastructureError, ToolBatchMetadata, ToolExecutionContext,
-	ToolExecutionResult, ToolInfrastructureError, parse_arguments,
+	ToolBackend, ToolBatchExecution, ToolBatchInfrastructureError, ToolBatchMetadata,
+	ToolExecutionContext, ToolExecutionResult, ToolInfrastructureError, bound_replay_output,
+	parse_arguments,
 };
 pub use config::{
 	BuiltinTool, ManagedToolConfig, RuntimeLimits, ToolBackendConfig, ToolRuntimeConfig,
 };
 pub(crate) use e2b::E2bSandboxBackend;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 pub(crate) use http_backend::HttpToolBackend;
 pub(crate) use mapper::prepare;
+pub(crate) use program::{
+	ProgramOutcome, ProgramReplayEntry, ProgramSandbox, ProgramSandboxExecution,
+	ProgramSandboxRequest, build_sandbox_request, fit_replay_entry, has_replay_entry_capacity,
+	parse_sandbox_outcome, program_protocol_stdout_max_bytes,
+};
+use rand::RngExt;
 pub(crate) use registry::ToolRegistry;
 pub(crate) use remote_mcp::{RemoteMcpBackend, RemoteMcpTool};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 pub(crate) use telemetry::ToolExecutionRecord;
 pub use telemetry::{
 	SandboxOperation, SandboxOperationDurationLabels, SandboxOperationLabels,
@@ -38,21 +54,10 @@ pub use telemetry::{
 	ToolRuntimeOutcomeLabels,
 };
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use agent_core::prelude::Strng;
-use agent_llm::types::responses;
-use futures_util::stream::{FuturesUnordered, StreamExt};
-use rand::RngExt;
-use serde_json::{Value, json};
-
-use crate::http::Response;
-use crate::proxy::httpproxy::PolicyClient;
-
 use self::telemetry::ToolRuntimeTelemetry;
 use self::transport::truncate_utf8_bytes;
+use crate::http::Response;
+use crate::proxy::httpproxy::PolicyClient;
 
 trait ResponsesRequestExt {
 	fn rest_field(&self, name: &str) -> Option<&Value>;
@@ -124,11 +129,44 @@ fn saturating_add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64>
 
 pub(crate) const WEB_SEARCH_FUNCTION: &str = "_agentgateway_web_search";
 pub(crate) const CODE_INTERPRETER_FUNCTION: &str = "_agentgateway_code_interpreter";
+pub(crate) const PROGRAMMATIC_FUNCTION: &str = "_agentgateway_programmatic_tool_calling";
 pub(crate) const REMOTE_MCP_FUNCTION_PREFIX: &str = "_agentgateway_mcp_";
 pub(crate) const SANDBOX_MAX_BATCH_EXECUTIONS: usize = 8;
 pub(crate) const SANDBOX_MAX_CALL_ID_BYTES: usize = 256;
 pub(crate) const SANDBOX_MAX_CODE_BYTES: usize = 32 * 1024;
 pub(crate) const SANDBOX_MAX_BATCH_DEADLINE: Duration = Duration::from_secs(24 * 60 * 60);
+const PROGRAMMATIC_MAX_CATALOG_BYTES: usize = remote_mcp::MAX_DISCOVERY_BYTES;
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AllowedCaller {
+	Direct,
+	Programmatic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AllowedCallers {
+	pub(super) direct: bool,
+	pub(super) programmatic: bool,
+}
+
+impl Default for AllowedCallers {
+	fn default() -> Self {
+		Self {
+			direct: true,
+			programmatic: false,
+		}
+	}
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ProgrammaticToolSpec {
+	pub(crate) public_name: Strng,
+	pub(crate) internal_name: Strng,
+	pub(crate) description: String,
+	pub(crate) input_schema: Value,
+	pub(crate) output_schema: Option<Value>,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RuntimeDeadline(tokio::time::Instant);
@@ -153,12 +191,21 @@ impl RuntimeDeadline {
 pub(crate) struct PreparedToolRuntime {
 	pub(crate) registry: Arc<ToolRegistry>,
 	pub(crate) canonical_request: responses::Request,
+	programmatic_requested: bool,
+	programmatic_tools: Arc<HashMap<Strng, ProgrammaticToolSpec>>,
+	programmatic_catalog_bytes: usize,
 	pub(crate) parallel: bool,
 	pub(crate) client_streaming: bool,
 	pub(crate) include_obfuscation: bool,
 	pub(crate) client_tools: Option<Value>,
 	pub(crate) deadline: RuntimeDeadline,
 	pub(crate) pending_remote_mcp: Vec<RemoteMcpServer>,
+}
+
+#[derive(Debug)]
+pub(crate) enum CollectedToolCalls {
+	Direct(Vec<ManagedToolCall>),
+	Programmatic { call_id: Strng, code: String },
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +215,7 @@ pub(crate) struct RemoteMcpServer {
 	pub server_url: String,
 	pub authorization: Option<secrecy::SecretString>,
 	pub allowed_tools: Option<Vec<String>>,
+	pub allowed_callers: AllowedCallers,
 }
 
 impl PreparedToolRuntime {
@@ -195,6 +243,8 @@ impl PreparedToolRuntime {
 					.map_err(ToolRuntimeError::infrastructure)?;
 			self.install_remote_mcp_tools(server_index, backend, tools)?;
 		}
+		self.pending_remote_mcp.clear();
+		self.refresh_programmatic_schema()?;
 		if self
 			.canonical_request
 			.rest_field("tool_choice")
@@ -205,7 +255,6 @@ impl PreparedToolRuntime {
 				"mcp tool_choice does not match an imported tool",
 			));
 		}
-		self.pending_remote_mcp.clear();
 		Ok(())
 	}
 
@@ -218,6 +267,9 @@ impl PreparedToolRuntime {
 		let server = self.pending_remote_mcp.get(server_index).ok_or_else(|| {
 			ToolRuntimeError::invalid_configuration("remote MCP server index is invalid")
 		})?;
+		let server_label = server.server_label.clone();
+		let server_description = server.server_description.clone();
+		let allowed_callers = server.allowed_callers;
 		let mut declarations = self
 			.canonical_request
 			.rest_field("tools")
@@ -229,37 +281,60 @@ impl PreparedToolRuntime {
 			let internal_name = Strng::from(format!(
 				"{REMOTE_MCP_FUNCTION_PREFIX}{server_index}_{tool_index}"
 			));
-			let public_name = Strng::from(format!("{}.{}", server.server_label, tool.remote_name));
+			let public_name = Strng::from(format!("{}.{}", server_label, tool.remote_name));
 			let argument_schema = schema::ArgumentSchema::compile(&tool.input_schema)
 				.map_err(|()| ToolRuntimeError::infrastructure(ToolInfrastructureError::backend()))?;
-			let description = match (&server.server_description, tool.description) {
+			let description = match (&server_description, tool.description) {
 				(Some(server_description), Some(tool_description)) => format!(
 					"[{}] {server_description}\n\n{tool_description}",
-					server.server_label
+					server_label
 				),
-				(Some(description), None) => format!("[{}] {description}", server.server_label),
-				(None, Some(description)) => format!("[{}] {description}", server.server_label),
-				(None, None) => format!("Tool from remote MCP server {}", server.server_label),
+				(Some(description), None) => format!("[{}] {description}", server_label),
+				(None, Some(description)) => format!("[{}] {description}", server_label),
+				(None, None) => format!("Tool from remote MCP server {}", server_label),
 			};
 			let description = truncate_utf8(description, remote_mcp::MAX_DESCRIPTION_BYTES);
-			declarations.push(json!({
-				"type": "function",
-				"name": internal_name,
-				"description": description,
-				"strict": false,
-				"parameters": tool.input_schema,
-			}));
+			if allowed_callers.direct {
+				declarations.push(json!({
+					"type": "function",
+					"name": internal_name,
+					"description": description,
+					"strict": false,
+					"parameters": tool.input_schema,
+				}));
+			}
+			if allowed_callers.programmatic {
+				if self.programmatic_tools.contains_key(public_name.as_str()) {
+					return Err(ToolRuntimeError::invalid_request(
+						"duplicate programmatic tool name",
+					));
+				}
+				let spec = ProgrammaticToolSpec {
+					public_name: public_name.clone(),
+					internal_name: internal_name.clone(),
+					description: description.clone(),
+					input_schema: tool.input_schema.clone(),
+					output_schema: tool.output_schema.clone(),
+				};
+				let next_size = checked_programmatic_catalog_add(
+					self.programmatic_catalog_bytes,
+					!self.programmatic_tools.is_empty(),
+					&spec,
+				)?;
+				Arc::make_mut(&mut self.programmatic_tools).insert(public_name.clone(), spec);
+				self.programmatic_catalog_bytes = next_size;
+			}
 			let forced_mcp_tool = self
 				.canonical_request
 				.rest_field("tool_choice")
 				.and_then(Value::as_object)
 				.filter(|choice| choice.get("type").and_then(Value::as_str) == Some("mcp"))
 				.filter(|choice| {
-					choice.get("server_label").and_then(Value::as_str) == Some(server.server_label.as_str())
+					choice.get("server_label").and_then(Value::as_str) == Some(server_label.as_str())
 				})
 				.and_then(|choice| choice.get("name").and_then(Value::as_str))
 				== Some(tool.remote_name.as_str());
-			if forced_mcp_tool {
+			if forced_mcp_tool && allowed_callers.direct {
 				self.canonical_request.replace_rest_field(
 					"tool_choice",
 					json!({"type": "function", "name": internal_name}),
@@ -287,17 +362,128 @@ impl PreparedToolRuntime {
 		backend: Arc<dyn ToolBackend>,
 		tools: Vec<RemoteMcpTool>,
 	) -> Result<(), ToolRuntimeError> {
-		self.install_remote_mcp_tools(server_index, backend, tools)
+		self.install_remote_mcp_tools(server_index, backend, tools)?;
+		self.refresh_programmatic_schema()
+	}
+
+	pub(crate) fn refresh_programmatic_schema(&mut self) -> Result<(), ToolRuntimeError> {
+		let mut declarations = self
+			.canonical_request
+			.rest_field("tools")
+			.and_then(Value::as_array)
+			.cloned()
+			.unwrap_or_default();
+		declarations
+			.retain(|tool| tool.get("name").and_then(Value::as_str) != Some(PROGRAMMATIC_FUNCTION));
+		if !self.programmatic_requested {
+			self
+				.canonical_request
+				.replace_rest_field("tools", Value::Array(declarations));
+			return Ok(());
+		}
+		if self.programmatic_tools.is_empty() {
+			if self.pending_remote_mcp.is_empty() {
+				return Err(ToolRuntimeError::invalid_request(
+					"programmatic_tool_calling requires at least one programmatic tool",
+				));
+			}
+			self
+				.canonical_request
+				.replace_rest_field("tools", Value::Array(declarations));
+			return Ok(());
+		}
+
+		let mut catalog = self.programmatic_tools.values().collect::<Vec<_>>();
+		catalog.sort_by(|left, right| left.public_name.cmp(&right.public_name));
+		let catalog = catalog
+			.into_iter()
+			.map(programmatic_catalog_entry)
+			.collect::<Vec<_>>();
+		let catalog = serde_json::to_string(&catalog).map_err(|_| ToolRuntimeError::internal())?;
+		if catalog.len() > PROGRAMMATIC_MAX_CATALOG_BYTES {
+			return Err(ToolRuntimeError::invalid_request(
+				"programmatic tool catalog exceeds the 2097152-byte limit",
+			));
+		}
+		declarations.push(json!({
+			"type": "function",
+			"name": PROGRAMMATIC_FUNCTION,
+			"description": format!(
+				"Write one Python program. Call authorized tools sequentially with tools.call(name, arguments) and finish with program_output(value). Do not call these tools directly. For a catalog entry with output_schema, output_schema describes the structuredContent field in the successful object returned by tools.call. Available tools: {catalog}"
+			),
+			"strict": true,
+			"parameters": {
+				"type": "object",
+				"properties": {"code": {"type": "string"}},
+				"required": ["code"],
+				"additionalProperties": false
+			}
+		}));
+		self
+			.canonical_request
+			.replace_rest_field("tools", Value::Array(declarations));
+		Ok(())
+	}
+
+	pub(crate) fn resolve_programmatic_call(
+		&self,
+		execution_id: &str,
+		sequence: usize,
+		public_name: &str,
+		arguments: Value,
+	) -> Result<ManagedToolCall, ToolRuntimeError> {
+		let spec = self.programmatic_tools.get(public_name).ok_or_else(|| {
+			ToolRuntimeError::invalid_request("programmatic call used an undeclared tool")
+		})?;
+		let registered = self
+			.registry
+			.by_internal_name
+			.get(spec.internal_name.as_str())
+			.ok_or_else(|| {
+				ToolRuntimeError::invalid_configuration("programmatic tool is not registered")
+			})?;
+		if !registered
+			.argument_schema
+			.as_ref()
+			.is_some_and(|schema| schema.is_valid(&arguments))
+		{
+			return Err(ToolRuntimeError::invalid_request(
+				"programmatic tool arguments do not match declared schema",
+			));
+		}
+		Ok(ManagedToolCall {
+			public_name: registered.public_name.clone(),
+			internal_name: spec.internal_name.clone(),
+			call_id: Strng::from(format!("programmatic_{execution_id}_{sequence}")),
+			arguments,
+			trusted_options: registered
+				.trusted_options
+				.clone()
+				.unwrap_or_else(|| Value::Object(Default::default())),
+		})
 	}
 
 	/// Authorize and parse the function calls emitted by one model Response.
 	///
 	/// A configured tool is not sufficient authorization on its own: the tool
 	/// must also have been declared in this request's canonical tool list.
+	#[cfg(test)]
 	pub(crate) fn collect_calls(
 		&self,
 		response: &responses::Response,
 	) -> Result<Vec<ManagedToolCall>, ToolRuntimeError> {
+		match self.collect_model_calls(response)? {
+			CollectedToolCalls::Direct(calls) => Ok(calls),
+			CollectedToolCalls::Programmatic { .. } => Err(ToolRuntimeError::invalid_request(
+				"programmatic calls require the managed runner",
+			)),
+		}
+	}
+
+	pub(crate) fn collect_model_calls(
+		&self,
+		response: &responses::Response,
+	) -> Result<CollectedToolCalls, ToolRuntimeError> {
 		let declared = self
 			.canonical_request
 			.rest_field("tools")
@@ -309,6 +495,7 @@ impl PreparedToolRuntime {
 			.collect::<HashSet<_>>();
 		let mut seen_call_ids = HashSet::new();
 		let mut calls = Vec::new();
+		let mut programmatic = None;
 		for item in &response.output {
 			let responses::typed::OutputItem::FunctionCall(call) = item else {
 				continue;
@@ -324,6 +511,31 @@ impl PreparedToolRuntime {
 			if call.call_id.is_empty() || !seen_call_ids.insert(call.call_id.as_str()) {
 				return Err(ToolRuntimeError::invalid_request(
 					"model generated an empty or duplicate managed tool call id",
+				));
+			}
+			if call.name == PROGRAMMATIC_FUNCTION {
+				if !self.programmatic_requested || !declared.contains(PROGRAMMATIC_FUNCTION) {
+					return Err(ToolRuntimeError::invalid_request(
+						"model generated an undeclared programmatic tool call",
+					));
+				}
+				if call.call_id.len() > SANDBOX_MAX_CALL_ID_BYTES {
+					return Err(ToolRuntimeError::limit(
+						"Sandbox call id exceeds the 256-byte limit",
+						ToolRuntimeLimit::SandboxCallId,
+					));
+				}
+				if programmatic.is_some() || !calls.is_empty() || call.namespace.is_some() {
+					return Err(ToolRuntimeError::invalid_request(
+						"model generated an invalid programmatic tool batch",
+					));
+				}
+				programmatic = Some((Strng::from(call.call_id.clone()), call.arguments.as_str()));
+				continue;
+			}
+			if programmatic.is_some() {
+				return Err(ToolRuntimeError::invalid_request(
+					"model mixed programmatic and direct tool calls in one response",
 				));
 			}
 			if call.namespace.is_some() || !declared.contains(call.name.as_str()) {
@@ -365,9 +577,85 @@ impl PreparedToolRuntime {
 					.unwrap_or_else(|| Value::Object(Default::default())),
 			});
 		}
+		if let Some((call_id, arguments)) = programmatic {
+			let arguments = parse_arguments(
+				arguments.as_bytes(),
+				self.registry.limits.max_arguments_bytes,
+			)?;
+			let object = arguments.as_object().ok_or_else(|| {
+				ToolRuntimeError::invalid_request("programmatic call arguments must be an object")
+			})?;
+			if object.len() != 1 {
+				return Err(ToolRuntimeError::invalid_request(
+					"programmatic call requires only the code argument",
+				));
+			}
+			let code = object.get("code").and_then(Value::as_str).ok_or_else(|| {
+				ToolRuntimeError::invalid_request("programmatic call requires string code")
+			})?;
+			if code.len() > SANDBOX_MAX_CODE_BYTES {
+				return Err(ToolRuntimeError::invalid_request(
+					"programmatic code exceeds the 32768-byte limit",
+				));
+			}
+			return Ok(CollectedToolCalls::Programmatic {
+				call_id,
+				code: code.to_owned(),
+			});
+		}
 		validate_sandbox_contract(&self.registry, &calls, self.parallel)?;
-		Ok(calls)
+		Ok(CollectedToolCalls::Direct(calls))
 	}
+}
+
+fn programmatic_catalog_entry_bytes(
+	spec: &ProgrammaticToolSpec,
+) -> Result<usize, ToolRuntimeError> {
+	serde_json::to_vec(&programmatic_catalog_entry(spec))
+		.map(|value| value.len())
+		.map_err(|_| ToolRuntimeError::internal())
+}
+
+fn programmatic_catalog_entry(spec: &ProgrammaticToolSpec) -> Value {
+	let mut entry = json!({
+		"name": spec.public_name,
+		"description": spec.description,
+		"input_schema": spec.input_schema,
+	});
+	if let Some(output_schema) = &spec.output_schema {
+		entry["output_schema"] = output_schema.clone();
+	}
+	entry
+}
+
+fn checked_programmatic_catalog_add(
+	current_bytes: usize,
+	has_existing_entry: bool,
+	spec: &ProgrammaticToolSpec,
+) -> Result<usize, ToolRuntimeError> {
+	let entry_bytes = programmatic_catalog_entry_bytes(spec)?;
+	let next = current_bytes
+		.checked_add(usize::from(has_existing_entry))
+		.and_then(|value| value.checked_add(entry_bytes))
+		.ok_or_else(ToolRuntimeError::internal)?;
+	if next > PROGRAMMATIC_MAX_CATALOG_BYTES {
+		return Err(ToolRuntimeError::invalid_request(
+			"programmatic tool catalog exceeds the 2097152-byte limit",
+		));
+	}
+	Ok(next)
+}
+
+fn programmatic_catalog_bytes(
+	tools: &HashMap<Strng, ProgrammaticToolSpec>,
+) -> Result<usize, ToolRuntimeError> {
+	let mut bytes = 2usize;
+	let mut has_existing_entry = false;
+	for spec in tools.values() {
+		bytes = checked_programmatic_catalog_add(bytes, has_existing_entry, spec)?;
+		has_existing_entry = true;
+	}
+	Ok(bytes)
 }
 
 fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
@@ -573,6 +861,9 @@ pub(crate) struct RuntimeBudget {
 	max_output_bytes: usize,
 	request_id: Option<Strng>,
 	backends: HashMap<Strng, BoundBackend>,
+	program_sandbox: Option<Arc<dyn ProgramSandbox>>,
+	program_sandbox_executions: usize,
+	next_execution_index: usize,
 	telemetry: ToolRuntimeTelemetry,
 }
 
@@ -596,6 +887,7 @@ impl RuntimeBudget {
 	) -> Result<Self, ToolRuntimeError> {
 		let telemetry = ToolRuntimeTelemetry::new(client.inputs.metrics.clone());
 		let mut backends = HashMap::with_capacity(registry.by_internal_name.len());
+		let mut program_sandbox = None;
 		for (internal_name, registered) in registry.by_internal_name.iter() {
 			if let Some(request_backend) = &registered.request_backend {
 				backends.insert(
@@ -638,8 +930,8 @@ impl RuntimeBudget {
 					domain,
 					timeout,
 					api_key,
-				} => (
-					Arc::new(
+				} => {
+					let backend = Arc::new(
 						E2bSandboxBackend::new(
 							client.clone(),
 							api_url.clone(),
@@ -653,13 +945,20 @@ impl RuntimeBudget {
 							telemetry.record_request(error.telemetry_outcome());
 							error
 						})?,
-					),
-					ToolBackendLabel::E2b,
-				),
+					);
+					program_sandbox = Some(backend.clone() as Arc<dyn ProgramSandbox>);
+					(backend as Arc<dyn ToolBackend>, ToolBackendLabel::E2b)
+				},
 			};
 			backends.insert(internal_name.clone(), BoundBackend { backend, label });
 		}
-		Ok(Self::from_backends(registry, backends, telemetry, deadline))
+		Ok(Self::from_backends(
+			registry,
+			backends,
+			program_sandbox,
+			telemetry,
+			deadline,
+		))
 	}
 
 	fn backend_construction_error(error: ToolInfrastructureError) -> ToolRuntimeError {
@@ -674,6 +973,7 @@ impl RuntimeBudget {
 	fn from_backends(
 		registry: &ToolRegistry,
 		backends: HashMap<Strng, BoundBackend>,
+		program_sandbox: Option<Arc<dyn ProgramSandbox>>,
 		telemetry: ToolRuntimeTelemetry,
 		deadline: RuntimeDeadline,
 	) -> Self {
@@ -687,6 +987,9 @@ impl RuntimeBudget {
 			max_output_bytes: registry.limits.max_output_bytes,
 			request_id: None,
 			backends,
+			program_sandbox,
+			program_sandbox_executions: 0,
+			next_execution_index: 0,
 			telemetry,
 		}
 	}
@@ -699,6 +1002,7 @@ impl RuntimeBudget {
 		Self::from_backends(
 			registry,
 			Self::bind_test_backends(registry, backends),
+			None,
 			ToolRuntimeTelemetry::default(),
 			RuntimeDeadline::new(registry.limits.total_timeout),
 		)
@@ -713,7 +1017,23 @@ impl RuntimeBudget {
 		Self::from_backends(
 			registry,
 			Self::bind_test_backends(registry, backends),
+			None,
 			ToolRuntimeTelemetry::new(metrics),
+			RuntimeDeadline::new(registry.limits.total_timeout),
+		)
+	}
+
+	#[cfg(test)]
+	pub(crate) fn with_test_backends_and_program_sandbox(
+		registry: &ToolRegistry,
+		backends: HashMap<String, Arc<dyn ToolBackend>>,
+		program_sandbox: Arc<dyn ProgramSandbox>,
+	) -> Self {
+		Self::from_backends(
+			registry,
+			Self::bind_test_backends(registry, backends),
+			Some(program_sandbox),
+			ToolRuntimeTelemetry::default(),
 			RuntimeDeadline::new(registry.limits.total_timeout),
 		)
 	}
@@ -758,6 +1078,85 @@ impl RuntimeBudget {
 
 	pub(crate) fn tool_calls(&self) -> usize {
 		self.tool_calls
+	}
+
+	pub(crate) fn max_output_bytes(&self) -> usize {
+		self.max_output_bytes
+	}
+
+	#[cfg(test)]
+	pub(crate) fn program_sandbox_executions(&self) -> usize {
+		self.program_sandbox_executions
+	}
+
+	pub(crate) async fn execute_program_sandbox(
+		&mut self,
+		request: ProgramSandboxRequest,
+	) -> Result<ProgramSandboxExecution, ToolRuntimeError> {
+		let sandbox = self.program_sandbox.clone().ok_or_else(|| {
+			ToolRuntimeError::invalid_configuration("program sandbox backend is not bound")
+		})?;
+		let remaining = self.remaining();
+		if remaining.is_zero() {
+			let error = ToolRuntimeError::deadline_exceeded();
+			self.record_error(&error);
+			return Err(error);
+		}
+		let execution_index = self.next_execution_index;
+		self.next_execution_index = self
+			.next_execution_index
+			.checked_add(1)
+			.ok_or_else(|| ToolRuntimeError::invalid_configuration("program execution index overflow"))?;
+		self.program_sandbox_executions =
+			self
+				.program_sandbox_executions
+				.checked_add(1)
+				.ok_or_else(|| {
+					ToolRuntimeError::invalid_configuration("program sandbox execution count overflow")
+				})?;
+		for operation in [
+			SandboxOperation::Execute,
+			SandboxOperation::Create,
+			SandboxOperation::Cleanup,
+			SandboxOperation::Terminate,
+		] {
+			self
+				.telemetry
+				.start_sandbox_operation(execution_index, operation);
+		}
+		let context = ToolExecutionContext {
+			request_id: self.request_id.clone(),
+			deadline: Some(Instant::now() + remaining),
+		};
+		match tokio::time::timeout_at(self.deadline, sandbox.run(request, context)).await {
+			Ok(Ok(execution)) => {
+				finish_sandbox_metadata(&self.telemetry, execution_index, execution.metadata, None);
+				Ok(execution)
+			},
+			Ok(Err(error)) => {
+				let fallback = (error.error == ToolInfrastructureError::Timeout)
+					.then_some(SandboxOperationOutcome::Timeout);
+				finish_sandbox_metadata(
+					&self.telemetry,
+					execution_index,
+					error.metadata,
+					fallback.or(Some(SandboxOperationOutcome::Failure)),
+				);
+				let error = ToolRuntimeError::infrastructure(error.error);
+				self.record_error(&error);
+				Err(error)
+			},
+			Err(_) => {
+				record_unfinished_sandbox_operations(
+					&self.telemetry,
+					&[PendingSandboxOperation { execution_index }],
+					SandboxOperationOutcome::Timeout,
+				);
+				let error = ToolRuntimeError::deadline_exceeded();
+				self.record_error(&error);
+				Err(error)
+			},
+		}
 	}
 
 	#[cfg(test)]
@@ -830,7 +1229,7 @@ impl RuntimeBudget {
 	}
 
 	fn reserve_calls(&mut self, count: usize) -> Result<usize, ToolRuntimeError> {
-		let start = self.tool_calls;
+		let start = self.next_execution_index;
 		let total = self.tool_calls.checked_add(count).ok_or_else(|| {
 			ToolRuntimeError::limit(
 				"managed tool call limit exceeded",
@@ -846,7 +1245,12 @@ impl RuntimeBudget {
 				ToolRuntimeLimit::ToolCalls,
 			));
 		}
+		let next_execution_index = self
+			.next_execution_index
+			.checked_add(count)
+			.ok_or_else(|| ToolRuntimeError::invalid_configuration("tool execution index overflow"))?;
 		self.tool_calls = total;
+		self.next_execution_index = next_execution_index;
 		Ok(start)
 	}
 }
@@ -1629,13 +2033,14 @@ async fn execute_operation(
 				},
 				truncated,
 			);
+			let value = json!({
+				"type": "function_call_output",
+				"call_id": call.call.call_id,
+				"output": output,
+			});
 			Ok(IndexedOutput {
 				index: call.index,
-				value: json!({
-					"type": "function_call_output",
-					"call_id": call.call.call_id,
-					"output": output,
-				}),
+				value,
 			})
 		})
 		.collect::<Result<Vec<_>, _>>();

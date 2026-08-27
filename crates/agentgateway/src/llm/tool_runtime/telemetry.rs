@@ -658,6 +658,9 @@ mod tests {
 			max_output_bytes: 1024,
 			request_id: None,
 			backends: HashMap::new(),
+			program_sandbox: None,
+			program_sandbox_executions: 0,
+			next_execution_index: 0,
 			telemetry,
 		}
 	}

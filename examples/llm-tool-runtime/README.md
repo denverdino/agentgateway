@@ -170,6 +170,35 @@ approval interruption; `"always"` and per-tool approval policies are rejected.
 The MCP authorization value is never forwarded to the model or echoed in the
 final Response.
 
+AgentGateway-managed Programmatic Tool Calling is an opt-in Python extension
+for upstream models that do not provide OpenAI's native JavaScript/V8 runtime.
+Declare `programmatic_tool_calling` and set `allowed_callers` to
+`["programmatic"]` or `["direct", "programmatic"]` on Web Search, Code
+Interpreter, or Remote MCP declarations. The generated Python calls one
+authorized tool at a time with `tools.call(name, arguments)` and completes with
+`program_output(value)`. Remote MCP names use
+`{server_label}.{tool_name}`, for example:
+
+```python
+forecast = tools.call("weather.get_forecast", {"q": "Shanghai", "days": 3})
+program_output(forecast["structuredContent"])
+```
+
+When a Remote MCP tool advertises `outputSchema`, AgentGateway includes it as
+`output_schema` in the programmatic tool catalog. The schema describes the
+`structuredContent` field of the successful object returned by `tools.call`.
+
+Each unresolved call is executed through AgentGateway's existing authorized
+backend and the Python program is replayed with a verified transcript. Replay
+divergence terminates the request instead of retrying after possible tool side
+effects. Large nested results may be truncated further to fit the aggregate
+replay budget. If that budget cannot hold another bounded result, the model
+receives a `program_replay_limit` tool error and no additional nested tool is
+executed. Python runs through the configured E2B Code Interpreter backend, even when the
+program only calls Web Search or MCP. The Sandbox keeps E2B's default network
+behavior; AgentGateway does not inject backend URLs, tokens, or E2B credentials
+into the generated program.
+
 Managed execution is foreground-only. Active managed requests support
 `stream: true`, but buffer the internal model/tool loop and emit only the final
 Response as OpenAI-compatible SSE events. This preserves the streaming wire
@@ -297,7 +326,7 @@ the default LLM compatible-mode `/v1` endpoint. The harness only loads
 these allowlisted names and never prints credentials or backend response
 bodies on failure.
 
-Build AgentGateway and run all five cases:
+Build AgentGateway and run all live cases:
 
 ```sh
 cargo build --release -p agentgateway-app
@@ -316,6 +345,7 @@ python3 examples/llm-tool-runtime/live_functional_test.py \
 ```
 
 The cases are `web-search`, `code-interpreter`, `combined`,
+`programmatic-server-tools`, `programmatic-mcp-weather`,
 `streaming-tool-runtime`, and `remote-mcp-weather`. The non-streaming cases
 check the HTTP response and final marker, then read the local AgentGateway
 metrics endpoint to prove the expected `http`, `e2b`, or `remote_mcp` backend
@@ -323,6 +353,15 @@ recorded a successful tool call. `remote-mcp-weather` discovers the allowlisted
 `get_forecast` and `get_current_weather` tools from the authenticated FC Web
 Function configured by `FC_WEATHER_MCP_URL`, queries Beijing weather, and
 requires the final marker `WEATHER_MCP_BEIJING_OK`.
+`programmatic-mcp-weather` exposes only `weather.get_forecast` to Python,
+requests exactly three forecast days (the WeatherAPI Free-plan window), and
+requires the day with the highest daily maximum and the day with the lowest
+daily minimum (choosing the earliest date for ties), plus
+`PROGRAMMATIC_MCP_WEATHER_3DAY_OK` in the final answer. With `--show-output`,
+the harness also enables a narrowly scoped debug event and prints every Python
+program generated for this case in model-round order before the final answer.
+Generated code can contain tool arguments, so use this opt-in output only with
+non-sensitive test prompts.
 The `combined` request sets `parallel_tool_calls: true`; AgentGateway runs
 independent Tool Backend operations concurrently up to `maxParallelToolCalls`
 and restores model call order before the next round. Setting the field to
@@ -337,6 +376,11 @@ uv run --with alibabacloud_fc20230330 \
 python3 examples/llm-tool-runtime/live_functional_test.py \
   --binary ./target/release/agentgateway \
   --case remote-mcp-weather \
+  --show-output
+
+python3 examples/llm-tool-runtime/live_functional_test.py \
+  --binary ./target/release/agentgateway \
+  --case programmatic-mcp-weather \
   --show-output
 ```
 

@@ -6,16 +6,16 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::llm::types::responses;
-
 use super::remote_mcp::{
 	MAX_ALLOWED_TOOLS, MAX_DESCRIPTION_BYTES, MAX_SERVER_LABEL_BYTES, MAX_TOOL_NAME_BYTES,
 };
 use super::schema::{ArgumentSchema, code_interpreter_parameters, web_search_parameters};
 use super::{
-	Activation, CODE_INTERPRETER_FUNCTION, PreparedToolRuntime, RemoteMcpServer, ResponsesRequestExt,
-	ToolRegistry, ToolRuntimeError, WEB_SEARCH_FUNCTION,
+	Activation, AllowedCaller, AllowedCallers, CODE_INTERPRETER_FUNCTION, PreparedToolRuntime,
+	ProgrammaticToolSpec, RemoteMcpServer, ResponsesRequestExt, ToolRegistry, ToolRuntimeError,
+	WEB_SEARCH_FUNCTION,
 };
+use crate::llm::types::responses;
 
 const RESERVED_PREFIX: &str = "_agentgateway_";
 
@@ -31,11 +31,13 @@ pub(crate) fn prepare(
 	let mut managed_function_present = false;
 	let mut builtin_present = false;
 	let mut remote_mcp_present = false;
+	let mut programmatic_requested = false;
 	let mut seen_mcp_labels = HashSet::new();
 	let mut pending_remote_mcp = Vec::new();
 	let mut rewritten = Vec::with_capacity(declarations.len());
 	let mut trusted_options = HashMap::new();
 	let mut argument_schemas = HashMap::new();
+	let mut programmatic_tools = Vec::new();
 
 	for declaration in declarations {
 		let kind = declaration
@@ -45,6 +47,18 @@ pub(crate) fn prepare(
 				ToolRuntimeError::invalid_request("tool declaration requires a string type")
 			})?;
 		match kind {
+			"programmatic_tool_calling" => {
+				if programmatic_requested
+					|| declaration
+						.as_object()
+						.is_some_and(|value| value.len() != 1)
+				{
+					return Err(ToolRuntimeError::invalid_request(
+						"programmatic_tool_calling may be declared once without options",
+					));
+				}
+				programmatic_requested = true;
+			},
 			"function" => {
 				let name = declaration
 					.get("name")
@@ -86,10 +100,22 @@ pub(crate) fn prepare(
 					)));
 				}
 				builtin_registry(registry, WEB_SEARCH_FUNCTION, "web_search")?;
-				let options = web_search_options(&declaration)?;
+				let (options, allowed_callers) = web_search_options(&declaration)?;
 				trusted_options.insert(Strng::from(WEB_SEARCH_FUNCTION), options);
 				builtin_present = true;
-				rewritten.push(web_search_schema());
+				if allowed_callers.programmatic {
+					programmatic_tools.push(ProgrammaticToolSpec {
+						public_name: Strng::from("web_search"),
+						internal_name: Strng::from(WEB_SEARCH_FUNCTION),
+						description: "Search the web for current information and return relevant sources."
+							.to_owned(),
+						input_schema: web_search_parameters(),
+						output_schema: None,
+					});
+				}
+				if allowed_callers.direct {
+					rewritten.push(web_search_schema());
+				}
 			},
 			"code_interpreter" => {
 				if !seen_builtin_types.insert(kind.to_owned()) {
@@ -98,9 +124,21 @@ pub(crate) fn prepare(
 					)));
 				}
 				builtin_registry(registry, CODE_INTERPRETER_FUNCTION, "code_interpreter")?;
-				code_interpreter_options(&declaration)?;
+				let allowed_callers = code_interpreter_options(&declaration)?;
 				builtin_present = true;
-				rewritten.push(code_interpreter_schema());
+				if allowed_callers.programmatic {
+					programmatic_tools.push(ProgrammaticToolSpec {
+						public_name: Strng::from("code_interpreter"),
+						internal_name: Strng::from(CODE_INTERPRETER_FUNCTION),
+						description: "Execute Python code in an isolated sandbox and return stdout and stderr."
+							.to_owned(),
+						input_schema: code_interpreter_parameters(),
+						output_schema: None,
+					});
+				}
+				if allowed_callers.direct {
+					rewritten.push(code_interpreter_schema());
+				}
 			},
 			"mcp" => {
 				if registry.is_none() {
@@ -122,10 +160,17 @@ pub(crate) fn prepare(
 		}
 	}
 
-	if !managed_function_present && !builtin_present && !remote_mcp_present {
+	if !managed_function_present && !builtin_present && !remote_mcp_present && !programmatic_requested
+	{
 		return Ok(Activation::Inactive);
 	}
-
+	if programmatic_requested
+		&& !registry.is_some_and(|registry| registry.has_internal(CODE_INTERPRETER_FUNCTION))
+	{
+		return Err(ToolRuntimeError::invalid_request(
+			"programmatic_tool_calling requires a configured code_interpreter E2B backend",
+		));
+	}
 	let registry = registry.expect("built-ins and managed functions require a registry");
 	for name in function_names {
 		if !registry.resolves_function(&name) {
@@ -177,16 +222,27 @@ pub(crate) fn prepare(
 	let client_tools = sanitize_client_tools(client_tools);
 	let prepared_registry = Arc::new(registry.with_request_data(trusted_options, argument_schemas));
 	let deadline = super::RuntimeDeadline::new(prepared_registry.limits.total_timeout);
-	Ok(Activation::Active(PreparedToolRuntime {
+	let programmatic_tools = programmatic_tools
+		.into_iter()
+		.map(|tool| (tool.public_name.clone(), tool))
+		.collect();
+	let programmatic_catalog_bytes = super::programmatic_catalog_bytes(&programmatic_tools)?;
+	let mut prepared = PreparedToolRuntime {
 		registry: prepared_registry,
 		canonical_request: request.clone(),
+		programmatic_requested,
+		programmatic_tools: Arc::new(programmatic_tools),
+		programmatic_catalog_bytes,
 		parallel,
 		client_streaming,
 		include_obfuscation,
 		client_tools,
 		deadline,
 		pending_remote_mcp,
-	}))
+	};
+	prepared.refresh_programmatic_schema()?;
+	*request = prepared.canonical_request.clone();
+	Ok(Activation::Active(prepared))
 }
 
 fn sanitize_client_tools(client_tools: Option<Value>) -> Option<Value> {
@@ -269,6 +325,7 @@ fn remote_mcp_options(declaration: &Value) -> Result<RemoteMcpServer, ToolRuntim
 		server_url: declaration.server_url,
 		authorization: declaration.authorization.map(SecretString::from),
 		allowed_tools: declaration.allowed_tools,
+		allowed_callers: parse_allowed_callers(declaration.allowed_callers)?,
 	})
 }
 
@@ -287,6 +344,8 @@ struct RemoteMcpDeclaration {
 	allowed_tools: Option<Vec<String>>,
 	#[serde(default)]
 	require_approval: Option<Value>,
+	#[serde(default)]
+	allowed_callers: Option<Vec<AllowedCaller>>,
 }
 
 fn declarations(request: &responses::Request) -> Result<Vec<Value>, ToolRuntimeError> {
@@ -338,7 +397,7 @@ fn unsupported_active_request_fields(request: &responses::Request) -> Result<(),
 	Ok(())
 }
 
-fn web_search_options(declaration: &Value) -> Result<Value, ToolRuntimeError> {
+fn web_search_options(declaration: &Value) -> Result<(Value, AllowedCallers), ToolRuntimeError> {
 	let declaration: WebSearchDeclaration =
 		serde_json::from_value(declaration.clone()).map_err(|error| {
 			ToolRuntimeError::invalid_request(format!("invalid web_search declaration: {error}"))
@@ -388,7 +447,10 @@ fn web_search_options(declaration: &Value) -> Result<Value, ToolRuntimeError> {
 			options.insert("user_location".to_owned(), location.into_json()?);
 		},
 	}
-	Ok(Value::Object(options))
+	Ok((
+		Value::Object(options),
+		parse_allowed_callers(declaration.allowed_callers)?,
+	))
 }
 
 #[derive(Deserialize)]
@@ -402,6 +464,8 @@ struct WebSearchDeclaration {
 	search_context_size: Option<Nullable<SearchContextSize>>,
 	#[serde(default)]
 	user_location: Option<Nullable<WebSearchUserLocation>>,
+	#[serde(default)]
+	allowed_callers: Option<Vec<AllowedCaller>>,
 }
 
 #[derive(Deserialize)]
@@ -488,17 +552,19 @@ enum Nullable<T> {
 	Null(()),
 }
 
-fn code_interpreter_options(declaration: &Value) -> Result<(), ToolRuntimeError> {
+fn code_interpreter_options(declaration: &Value) -> Result<AllowedCallers, ToolRuntimeError> {
 	let declaration = declaration
 		.as_object()
 		.expect("tool declaration is an object");
 	if declaration
 		.keys()
-		.any(|key| key != "type" && key != "container")
+		.any(|key| key != "type" && key != "container" && key != "allowed_callers")
 	{
 		let unsupported = declaration
 			.keys()
-			.find(|key| key.as_str() != "type" && key.as_str() != "container")
+			.find(|key| {
+				key.as_str() != "type" && key.as_str() != "container" && key.as_str() != "allowed_callers"
+			})
 			.expect("key was found");
 		return Err(ToolRuntimeError::invalid_request(format!(
 			"unsupported code_interpreter option {unsupported}"
@@ -515,16 +581,55 @@ fn code_interpreter_options(declaration: &Value) -> Result<(), ToolRuntimeError>
 			"code_interpreter container must be { type: auto }",
 		));
 	}
-	Ok(())
+	let callers = declaration
+		.get("allowed_callers")
+		.cloned()
+		.map(serde_json::from_value::<Vec<AllowedCaller>>)
+		.transpose()
+		.map_err(|error| {
+			ToolRuntimeError::invalid_request(format!(
+				"invalid code_interpreter allowed_callers: {error}"
+			))
+		})?;
+	parse_allowed_callers(callers)
+}
+
+fn parse_allowed_callers(
+	callers: Option<Vec<AllowedCaller>>,
+) -> Result<AllowedCallers, ToolRuntimeError> {
+	let Some(callers) = callers else {
+		return Ok(AllowedCallers::default());
+	};
+	if callers.is_empty() {
+		return Err(ToolRuntimeError::invalid_request(
+			"allowed_callers must contain direct, programmatic, or both",
+		));
+	}
+	let mut parsed = AllowedCallers {
+		direct: false,
+		programmatic: false,
+	};
+	for caller in callers {
+		let duplicate = match caller {
+			AllowedCaller::Direct => std::mem::replace(&mut parsed.direct, true),
+			AllowedCaller::Programmatic => std::mem::replace(&mut parsed.programmatic, true),
+		};
+		if duplicate {
+			return Err(ToolRuntimeError::invalid_request(
+				"allowed_callers must not contain duplicates",
+			));
+		}
+	}
+	Ok(parsed)
 }
 
 fn web_search_schema() -> Value {
 	json!({
-		"type": "function",
-		"name": WEB_SEARCH_FUNCTION,
-		"description": "Search the web for current information and return relevant sources.",
-		"strict": true,
-		"parameters": web_search_parameters()
+	 "type": "function",
+	 "name": WEB_SEARCH_FUNCTION,
+	 "description": "Search the web for current information and return relevant sources.",
+	 "strict": true,
+	 "parameters": web_search_parameters()
 	})
 }
 

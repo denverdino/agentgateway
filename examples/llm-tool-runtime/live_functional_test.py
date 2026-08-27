@@ -23,6 +23,8 @@ CASE_NAMES = (
     "web-search",
     "code-interpreter",
     "combined",
+    "programmatic-server-tools",
+    "programmatic-mcp-weather",
     "streaming-tool-runtime",
     "remote-mcp-weather",
 )
@@ -38,7 +40,14 @@ REQUIRED_KEYS = (
     "FC_WEATHER_MCP_URL",
     "FC_WEATHER_MCP_TOKEN",
 )
-OPTIONAL_KEYS = ("AGENTGATEWAY_LIVE_MODEL", "AGENTGATEWAY_LIVE_UPSTREAM_BASE_URL")
+OPTIONAL_KEYS = (
+    "AGENTGATEWAY_LIVE_MODEL",
+    "AGENTGATEWAY_LIVE_UPSTREAM_BASE_URL",
+    "AGENTGATEWAY_UPSTREAM_MODEL",
+    "AGENTGATEWAY_UPSTREAM_BASE_URL",
+    "OPENAI_MODEL",
+    "OPENAI_BASE_URL",
+)
 MAX_HTTP_BODY_BYTES = 2 * 1024 * 1024
 STARTUP_TIMEOUT_SECONDS = 20.0
 REQUEST_TIMEOUT_SECONDS = 150.0
@@ -110,9 +119,17 @@ class LiveConfiguration:
         self.e2b_domain = values["E2B_DOMAIN"]
         self.weather_mcp_url = values["FC_WEATHER_MCP_URL"]
         self.weather_mcp_token = values["FC_WEATHER_MCP_TOKEN"]
-        self.model = values.get("AGENTGATEWAY_LIVE_MODEL", DEFAULT_MODEL)
-        self.upstream_base_url = values.get(
-            "AGENTGATEWAY_LIVE_UPSTREAM_BASE_URL", DEFAULT_UPSTREAM_BASE_URL
+        self.model = (
+            values.get("AGENTGATEWAY_LIVE_MODEL")
+            or values.get("OPENAI_MODEL")
+            or values.get("AGENTGATEWAY_UPSTREAM_MODEL")
+            or DEFAULT_MODEL
+        )
+        self.upstream_base_url = (
+            values.get("AGENTGATEWAY_LIVE_UPSTREAM_BASE_URL")
+            or values.get("OPENAI_BASE_URL")
+            or values.get("AGENTGATEWAY_UPSTREAM_BASE_URL")
+            or DEFAULT_UPSTREAM_BASE_URL
         )
         require(bool(MODEL_NAME_PATTERN.fullmatch(self.model)), "live model name is invalid")
 
@@ -213,6 +230,14 @@ def case_payloads(
 ) -> Dict[str, Dict[str, Any]]:
     code_tool = {"type": "code_interpreter", "container": {"type": "auto"}}
     web_tool = {"type": "web_search"}
+    programmatic_code_tool = {
+        **code_tool,
+        "allowed_callers": ["programmatic"],
+    }
+    programmatic_web_tool = {
+        **web_tool,
+        "allowed_callers": ["programmatic"],
+    }
     weather_mcp_tool = {
         "type": "mcp",
         "server_label": "weather",
@@ -220,6 +245,15 @@ def case_payloads(
         "authorization": weather_mcp_token,
         "allowed_tools": ["get_forecast", "get_current_weather"],
         "require_approval": "auto",
+    }
+    programmatic_weather_mcp_tool = {
+        "type": "mcp",
+        "server_label": "weather",
+        "server_url": weather_mcp_url,
+        "authorization": weather_mcp_token,
+        "allowed_tools": ["get_forecast"],
+        "allowed_callers": ["programmatic"],
+        "require_approval": "never",
     }
     return {
         "web-search": {
@@ -251,6 +285,41 @@ def case_payloads(
                 "the exact marker COMBINED_OK_391 and the searched fact."
             ),
             "tools": [web_tool, code_tool],
+            "parallel_tool_calls": True,
+            "stream": False,
+        },
+        "programmatic-server-tools": {
+            "model": model,
+            "input": (
+                "Use programmatic tool calling to run one program that calls both tools. "
+                "Search the web for one fact about the AgentGateway open-source project, "
+                "and execute Python to calculate 29 * 31. After both programmatic calls "
+                "succeed, answer with the exact marker PROGRAMMATIC_SERVER_TOOLS_OK_899 "
+                "and the searched fact. Do not call either tool directly."
+            ),
+            "tools": [
+                programmatic_web_tool,
+                programmatic_code_tool,
+                {"type": "programmatic_tool_calling"},
+            ],
+            "parallel_tool_calls": True,
+            "stream": False,
+        },
+        "programmatic-mcp-weather": {
+            "model": model,
+            "input": (
+                "Use programmatic tool calling to run one Python program. In that program, "
+                "call weather.get_forecast for Shanghai with days=3. From the returned "
+                "3-day forecast, use Python to report the date and value with the highest "
+                "daily maximum temperature, and the date and value with the lowest daily "
+                "minimum temperature. If either result is tied, choose the earliest date. "
+                "Do not call the MCP tool directly. Finish with the exact marker "
+                "PROGRAMMATIC_MCP_WEATHER_3DAY_OK."
+            ),
+            "tools": [
+                programmatic_weather_mcp_tool,
+                {"type": "programmatic_tool_calling"},
+            ],
             "parallel_tool_calls": True,
             "stream": False,
         },
@@ -299,6 +368,56 @@ def extract_output_text(response: Mapping[str, Any]) -> str:
                 if isinstance(text, str) and text:
                     texts.append(text)
     return "\n".join(texts)
+
+
+def extract_programmatic_tool_codes(logs: str) -> List[str]:
+    codes: List[str] = []
+    for line in logs.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("message") != (
+            "generated programmatic tool call code"
+        ):
+            continue
+        code = event.get("programmatic_code")
+        if isinstance(code, str) and code:
+            codes.append(code)
+    return codes
+
+
+def print_case_output(case_name: str, text: str, program_codes: Sequence[str]) -> None:
+    if case_name == "programmatic-mcp-weather":
+        require(
+            bool(program_codes),
+            "programmatic weather case did not capture generated program code",
+        )
+        for index, code in enumerate(program_codes, start=1):
+            print("PROGRAMMATIC TOOL CALL CODE {} (Python)".format(index))
+            print(code)
+            print("END PROGRAMMATIC TOOL CALL CODE {}".format(index))
+    print(text)
+
+
+def live_case_groups(
+    selected_cases: Sequence[str], show_output: bool
+) -> List[Tuple[str, ...]]:
+    if not show_output or "programmatic-mcp-weather" not in selected_cases:
+        return [tuple(selected_cases)]
+    groups: List[Tuple[str, ...]] = []
+    pending: List[str] = []
+    for case_name in selected_cases:
+        if case_name == "programmatic-mcp-weather":
+            if pending:
+                groups.append(tuple(pending))
+                pending = []
+            groups.append((case_name,))
+        else:
+            pending.append(case_name)
+    if pending:
+        groups.append(tuple(pending))
+    return groups
 
 
 def tool_success_counts(metrics: str) -> Dict[Tuple[str, str], int]:
@@ -490,10 +609,14 @@ def expected_tool_backends(case_name: str) -> Tuple[Tuple[str, str], ...]:
         return (("code_interpreter", "e2b"),)
     if case_name == "remote-mcp-weather":
         return (("remote_mcp", "remote_mcp"),)
-    return (
-        ("web_search", "http"),
-        ("code_interpreter", "e2b"),
-    )
+    if case_name == "programmatic-mcp-weather":
+        return (("remote_mcp", "remote_mcp"),)
+    if case_name in ("combined", "programmatic-server-tools"):
+        return (
+            ("web_search", "http"),
+            ("code_interpreter", "e2b"),
+        )
+    raise HarnessFailure("unknown live functional case: {}".format(case_name))
 
 
 def expected_marker(case_name: str) -> str:
@@ -501,6 +624,8 @@ def expected_marker(case_name: str) -> str:
         "web-search": "WEB_SEARCH_OK",
         "code-interpreter": "CODE_INTERPRETER_OK_385",
         "combined": "COMBINED_OK_391",
+        "programmatic-server-tools": "PROGRAMMATIC_SERVER_TOOLS_OK_899",
+        "programmatic-mcp-weather": "PROGRAMMATIC_MCP_WEATHER_3DAY_OK",
         "streaming-tool-runtime": "STREAMING_TOOL_RUNTIME_OK",
         "remote-mcp-weather": "WEATHER_MCP_BEIJING_OK",
     }[case_name]
@@ -526,8 +651,7 @@ def run_case(
     token: str,
     case_name: str,
     payload: Mapping[str, Any],
-    show_output: bool,
-) -> None:
+) -> str:
     before = tool_success_counts(fetch_metrics(stats_port))
     if case_name == "streaming-tool-runtime":
         status, events = post_sse(base_url + "/v1/responses", token, payload)
@@ -543,6 +667,15 @@ def run_case(
         expected_marker(case_name) in text,
         "{} final output omitted its verification marker".format(case_name),
     )
+    if case_name == "programmatic-mcp-weather":
+        dates = set(re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", text))
+        lowered = text.lower()
+        require(
+            bool(dates)
+            and ("highest" in lowered or "hottest" in lowered or "最高" in text)
+            and ("lowest" in lowered or "coldest" in lowered or "最低" in text),
+            "programmatic weather output omitted the highest or lowest temperature day",
+        )
     after = tool_success_counts(fetch_metrics(stats_port))
     for tool, backend in expected_tool_backends(case_name):
         metric_key = (tool, backend)
@@ -552,9 +685,7 @@ def run_case(
                 case_name, tool, backend
             ),
         )
-    print("PASS {}".format(case_name))
-    if show_output:
-        print(text)
+    return text
 
 
 def run_gateway_attempt(
@@ -563,10 +694,14 @@ def run_gateway_attempt(
     selected_cases: Sequence[str],
     show_output: bool,
 ) -> None:
+    visible_weather_code = show_output and tuple(selected_cases) == (
+        "programmatic-mcp-weather",
+    )
     ports, reservations = reserve_loopback_ports(3)
     gateway_port, readiness_port, stats_port = ports
     client_token = secrets.token_urlsafe(32)
     process: Optional[subprocess.Popen[Any]] = None
+    weather_text: Optional[str] = None
     try:
         with tempfile.TemporaryDirectory(prefix="agentgateway-live-functional-") as temp_dir:
             temp_path = Path(temp_dir)
@@ -583,6 +718,11 @@ def run_gateway_attempt(
                 environment[
                     "AGENTGATEWAY_LIVE_UPSTREAM_BASE_URL"
                 ] = configuration.upstream_base_url
+                if visible_weather_code:
+                    environment["LOG_FORMAT"] = "json"
+                    environment["RUST_LOG"] = (
+                        "agentgateway::llm::tool_runtime::runner=debug"
+                    )
                 process = subprocess.Popen(
                     [str(binary), "--file", str(config_path)],
                     cwd=temp_dir,
@@ -606,18 +746,36 @@ def run_gateway_attempt(
                         configuration.weather_mcp_token,
                     )
                     for case_name in selected_cases:
-                        run_case(
+                        text = run_case(
                             base_url,
                             stats_port,
                             client_token,
                             case_name,
                             payloads[case_name],
-                            show_output,
                         )
+                        if visible_weather_code:
+                            weather_text = text
+                        else:
+                            if show_output:
+                                print_case_output(case_name, text, ())
+                            print("PASS {}".format(case_name))
                     require(process.poll() is None, "AgentGateway exited during live cases")
                 finally:
                     stop_process(process)
                     process = None
+            if weather_text is not None:
+                try:
+                    logs = log_path.read_text(encoding="utf-8")
+                except OSError as error:
+                    raise HarnessFailure(
+                        "could not read programmatic weather debug log"
+                    ) from error
+                print_case_output(
+                    "programmatic-mcp-weather",
+                    weather_text,
+                    extract_programmatic_tool_codes(logs),
+                )
+                print("PASS programmatic-mcp-weather")
     finally:
         close_reservations(reservations)
         if process is not None:
@@ -634,9 +792,12 @@ def run(
     require(binary.is_file(), "release binary path is not a file")
     require(os.access(str(binary), os.X_OK), "release binary path is not executable")
     configuration = LiveConfiguration.load(dotenv.expanduser().resolve(), os.environ)
-    run_with_startup_retries(
-        lambda: run_gateway_attempt(binary, configuration, selected_cases, show_output)
-    )
+    for case_group in live_case_groups(selected_cases, show_output):
+        run_with_startup_retries(
+            lambda case_group=case_group: run_gateway_attempt(
+                binary, configuration, case_group, show_output
+            )
+        )
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -662,7 +823,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--show-output",
         action="store_true",
-        help="print final model output after each passing case",
+        help="print final model output and Weather PTC-generated Python code",
     )
     return parser.parse_args(argv)
 

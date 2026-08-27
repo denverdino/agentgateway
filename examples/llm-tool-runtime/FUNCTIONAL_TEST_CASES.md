@@ -27,8 +27,10 @@ python3 examples/llm-tool-runtime/functional_test.py \
 | Same-Response multi-code reuse | `multi-code-reuse` | Direct E2B Rust protocol tests | HTTP 200 final round; exactly two model rounds; two stable call IDs in request order; exactly one Sandbox create/kill pair, two sequential context lifecycles, and no Web Search; canonical outputs remain `set\n` then `isolated\n`; aggregate usage `13/7/20`. OS filesystem/process state remains shared. |
 | Web Search and Code overlap | `dual-tool-overlap` | Hermetic Rust acceptance | Round one emits both reserved calls. Web Search and E2B create wait at a bounded two-party barrier and must observe each other before either can complete. Exactly one Web Search call and one E2B Sandbox lifecycle run; canonical output order follows model order rather than completion order. |
 | Multi-round usage and final-only response | `dual-tool-overlap` | Hermetic Rust acceptance | Exactly two model rounds; public model is `mock-model`; aggregate usage is `22/10/32`; only `msg_dual_final` is returned. Intermediate message, call IDs, Web Search snippet, code output, and function outputs do not leak into the client body. |
+| Python Programmatic Tool Calling replay | `programmatic-server-tools` | Protocol, E2B, budget, and runner Rust tests | The model emits one `{code}` synthetic call. AgentGateway performs two pending replays, executes one Web Search and one nested Code Interpreter call sequentially, performs a completed replay, and returns one normalized synthetic output. Four E2B lifecycles occur without charging Sandbox runs to `maxToolCalls`; only the two nested tools consume call budget. |
 | Managed streaming final response | `streaming-tool-runtime` (also live) | `responses_managed_tool_runtime_streams_only_the_final_answer` | HTTP 200 `text/event-stream`; internal model requests use `stream: false`; SSE contains the lifecycle and final text delta but no reserved tool name or intermediate result; `response.completed` carries aggregate usage; Web Search executes once. |
 | Live Beijing weather over remote MCP | `remote-mcp-weather` in the opt-in live harness | Remote MCP Rust protocol tests and `weather-mcp-fc` Node tests | HTTP 200 completed response; final output contains `WEATHER_MCP_BEIJING_OK`; the request exposes only `get_forecast` and `get_current_weather` from the authenticated FC MCP URL; local metrics prove a successful `remote_mcp` execution. |
+| Live three-day weather through a Python program | `programmatic-mcp-weather` in the opt-in live harness | Programmatic MCP catalog and replay Rust tests | The MCP declaration is programmatic-only and exposes `weather.get_forecast` as the public Python name. The generated Python requests `days=3` and selects the highest daily maximum plus the lowest daily minimum, choosing the earliest date for ties; the final answer contains both extreme days and `PROGRAMMATIC_MCP_WEATHER_3DAY_OK`; local metrics prove one successful `remote_mcp` call. |
 | HTTP 400 active-mode rejection | `active-mode-rejections` | Rust unit coverage | Each of background, conversation, managed+unmanaged mix, and untrusted client declaration of `_agentgateway_web_search` returns HTTP 400 with code `managed_tool_request_invalid`; zero requests reach the model or a tool backend. |
 | HTTP 502 tool transport/protocol failure | Not in the release harness; hermetic Rust | `responses_managed_tool_runtime_maps_tool_infrastructure_failure_to_502` | Public status 502 with a fixed sanitized infrastructure error; no backend body/URL/credential or model/tool content in the response; no next model round; started work is terminally accounted once. |
 | HTTP 502 Sandbox create failure | Not in the release harness; direct E2B Rust | E2B protocol unit tests | A non-201 or malformed create response is sanitized; no execution or kill occurs because no Sandbox ID was accepted; AgentGateway returns HTTP 502 and does not start another model round. |
@@ -85,11 +87,14 @@ is the opt-in end-to-end application for a real LLM model, FC Web Search
 Function, E2B-compatible Sandbox, and the deployed FC WeatherAPI MCP server. It
 starts a release AgentGateway with a temporary named-gateway config and verifies
 successful tool-call metric deltas for `web-search`, `code-interpreter`,
-`combined`, `streaming-tool-runtime`, and `remote-mcp-weather`. The streaming
+`combined`, `programmatic-server-tools`, `programmatic-mcp-weather`,
+`streaming-tool-runtime`, and `remote-mcp-weather`. The streaming
 case validates final-only Responses SSE output and a successful Web Search
 invocation; the MCP case queries Beijing weather through an allowlisted remote
-tool and validates a successful `remote_mcp` metric. It never modifies the
-operator's system config.
+tool and validates a successful `remote_mcp` metric. The programmatic MCP case
+uses the Free-plan three-day forecast window through `tools.call`. When invoked
+with `--show-output`, it prints all model-generated Python programs in execution
+order before the final forecast. It never modifies the operator's system config.
 
 The two ignored Rust live tests are automated backend smokes only when
 `AGENTGATEWAY_LIVE_TOOLS=1` and the Web Search plus three E2B variables are present.

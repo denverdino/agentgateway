@@ -1,7 +1,6 @@
 use std::error::Error;
-use std::fmt;
-use std::io;
 use std::sync::Arc;
+use std::{fmt, io};
 
 use serde_json::{Value, json};
 

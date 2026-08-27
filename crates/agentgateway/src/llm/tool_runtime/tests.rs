@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use http_body_util::BodyExt;
 use prometheus_client::encoding::prometheus_protobuf;
 use prometheus_client::encoding::prometheus_protobuf::prometheus_data_model::{
@@ -17,17 +18,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::backend::execute_sequentially;
 use super::{
-	Activation, BuiltinTool, ManagedToolConfig, PreparedToolRuntime, ResponsesRequestExt,
-	RuntimeBudget, RuntimeDeadline, RuntimeLimits, SandboxOperation, SandboxOperationLabels,
-	SandboxOperationOutcome, ToolBackendConfig, ToolExecutionOutcome, ToolRegistry,
-	ToolRuntimeConfig, ToolRuntimeOutcome, aggregate_usage, encode_streaming_response, execute_batch,
-	finalize_managed_response, prepare,
-};
-use super::{
-	E2bSandboxBackend, HttpToolBackend, ManagedToolCall, RemoteMcpBackend, RemoteMcpServer,
-	ToolApplicationError, ToolBackend, ToolBatchExecution, ToolBatchInfrastructureError,
-	ToolBatchMetadata, ToolExecutionContext, ToolExecutionResult, ToolInfrastructureError,
-	parse_arguments,
+	Activation, BuiltinTool, E2bSandboxBackend, HttpToolBackend, ManagedToolCall, ManagedToolConfig,
+	PreparedToolRuntime, ProgramSandbox, ProgramSandboxExecution, ProgramSandboxRequest,
+	RemoteMcpBackend, RemoteMcpServer, ResponsesRequestExt, RuntimeBudget, RuntimeDeadline,
+	RuntimeLimits, SandboxOperation, SandboxOperationLabels, SandboxOperationOutcome,
+	ToolApplicationError, ToolBackend, ToolBackendConfig, ToolBatchExecution,
+	ToolBatchInfrastructureError, ToolBatchMetadata, ToolExecutionContext, ToolExecutionOutcome,
+	ToolExecutionResult, ToolInfrastructureError, ToolRegistry, ToolRuntimeConfig,
+	ToolRuntimeOutcome, aggregate_usage, encode_streaming_response, execute_batch,
+	finalize_managed_response, parse_arguments, prepare,
 };
 
 mod config_tests;
@@ -95,6 +94,15 @@ fn registry_compile_rejects_invalid_runtime_semantics() {
 		ToolRuntimeConfig {
 			limits,
 			tools: vec![valid_tool()],
+		},
+	));
+	let mut limits = valid_limits.clone();
+	limits.max_output_bytes = 127;
+	cases.push((
+		"output limit cannot represent normalized errors",
+		ToolRuntimeConfig {
+			limits,
+			tools: vec![tool("python", Some(BuiltinTool::CodeInterpreter))],
 		},
 	));
 	cases.push((
@@ -349,6 +357,82 @@ async fn e2b_batch_reuses_one_sandbox_and_cleans_each_context_in_order() {
 	assert_eq!(execute_body["context_id"], "context_1");
 	assert_eq!(execute_body["language"], Value::Null);
 	assert_eq!(execute_body["env_vars"], Value::Null);
+}
+
+#[tokio::test]
+async fn e2b_program_run_code_passes_replay_through_env_vars() {
+	let server = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/sandboxes"))
+		.respond_with(ResponseTemplate::new(201).set_body_json(json!({
+			"sandboxID": "sandbox_program",
+			"domain": "sandbox.example.com"
+		})))
+		.mount(&server)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/contexts"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"program_context"})))
+		.mount(&server)
+		.await;
+	Mock::given(method("POST"))
+		.and(path("/execute"))
+		.respond_with(
+			ResponseTemplate::new(200)
+				.set_body_string("{\"type\":\"stdout\",\"text\":\"protocol\\n\",\"timestamp\":1}\n"),
+		)
+		.mount(&server)
+		.await;
+	Mock::given(method("DELETE"))
+		.and(path("/contexts/program_context"))
+		.respond_with(ResponseTemplate::new(204))
+		.mount(&server)
+		.await;
+	Mock::given(method("DELETE"))
+		.and(path("/sandboxes/sandbox_program"))
+		.respond_with(ResponseTemplate::new(204))
+		.mount(&server)
+		.await;
+
+	let backend = E2bSandboxBackend::new(
+		policy_client(),
+		server.uri().parse().unwrap(),
+		"sandbox.example.com".into(),
+		Duration::from_secs(2),
+		SecretString::from("operator-key"),
+		4096,
+	)
+	.unwrap();
+	let request = ProgramSandboxRequest {
+		source: "# fixed wrapper".into(),
+		env_vars: json!({
+			"AGENTGATEWAY_PTC_CODE":"Y29kZQ==",
+			"AGENTGATEWAY_PTC_REPLAY":"W10=",
+			"AGENTGATEWAY_PTC_NONCE":"nonce-1"
+		})
+		.as_object()
+		.unwrap()
+		.clone(),
+	};
+	let execution = ProgramSandbox::run(&backend, request, ToolExecutionContext::default())
+		.await
+		.unwrap();
+	assert!(matches!(execution.result, ToolExecutionResult::Python(_)));
+	let requests = server.received_requests().await.unwrap();
+	let execute = requests
+		.iter()
+		.find(|request| request.url.path() == "/execute")
+		.unwrap();
+	let body: Value = serde_json::from_slice(&execute.body).unwrap();
+	assert_eq!(body["language"], Value::Null);
+	assert_eq!(body["env_vars"]["AGENTGATEWAY_PTC_NONCE"], "nonce-1");
+	assert!(
+		body["code"]
+			.as_str()
+			.unwrap()
+			.contains("__ag_budget = [5615, False]"),
+		"program protocol must reserve base64 and framing headroom"
+	);
 }
 
 async fn wait_for_e2b_request(server: &MockServer, request_path: &str) {
@@ -844,6 +928,7 @@ async fn remote_mcp_discovery_obeys_total_runtime_deadline() {
 		server_url: format!("http://localhost:{}/mcp", address.port()),
 		authorization: None,
 		allowed_tools: None,
+		allowed_callers: super::AllowedCallers::default(),
 	};
 	let started = Instant::now();
 	let result = RemoteMcpBackend::connect_for_test(
@@ -901,8 +986,19 @@ async fn remote_mcp_discovers_filters_and_executes_over_one_session() {
 				.unwrap()
 				.clone(),
 			);
+			let output_schema = Arc::new(
+				json!({
+					"type": "object",
+					"properties": {"value": {"type": "integer"}},
+					"required": ["value"],
+					"additionalProperties": false
+				})
+				.as_object()
+				.unwrap()
+				.clone(),
+			);
 			Ok(ListToolsResult::with_all_items(vec![
-				Tool::new("roll", "Roll one die", schema.clone()),
+				Tool::new("roll", "Roll one die", schema.clone()).with_raw_output_schema(output_schema),
 				Tool::new("hidden", "Must be filtered", schema),
 			]))
 		}
@@ -949,6 +1045,7 @@ async fn remote_mcp_discovers_filters_and_executes_over_one_session() {
 		server_url: format!("http://localhost:{}/mcp", address.port()),
 		authorization: Some(SecretString::from("mcp-oauth-token")),
 		allowed_tools: Some(vec!["roll".into()]),
+		allowed_callers: super::AllowedCallers::default(),
 	};
 	let (backend, tools) = RemoteMcpBackend::connect_for_test(
 		policy_client(),
@@ -961,6 +1058,10 @@ async fn remote_mcp_discovers_filters_and_executes_over_one_session() {
 	assert_eq!(tools[0].remote_name, "roll");
 	assert_eq!(tools[0].description.as_deref(), Some("Roll one die"));
 	assert_eq!(tools[0].input_schema["required"], json!(["sides"]));
+	assert_eq!(
+		tools[0].output_schema.as_ref().unwrap()["required"],
+		json!(["value"])
+	);
 
 	let result = execute_one(
 		backend.as_ref(),
@@ -1057,6 +1158,7 @@ async fn remote_mcp_tools_are_installed_as_namespaced_model_functions() {
 					"required": ["sides"],
 					"additionalProperties": false
 				}),
+				output_schema: None,
 			}],
 		)
 		.unwrap();
@@ -1131,6 +1233,7 @@ async fn remote_mcp_composed_declaration_description_is_bounded() {
 				remote_name: "bounded".into(),
 				description: Some("t".repeat(4096)),
 				input_schema: json!({"type": "object"}),
+				output_schema: None,
 			}],
 		)
 		.unwrap();
@@ -1522,6 +1625,335 @@ fn maps_code_interpreter_to_exact_function_schema() {
 				"additionalProperties": false
 			}
 		})]
+	);
+}
+
+#[test]
+fn maps_programmatic_server_tools_to_python_code_function() {
+	let mut request = request(json!({
+		"input": "research and calculate",
+		"tools": [
+			{ "type": "programmatic_tool_calling" },
+			{
+				"type": "web_search",
+				"allowed_callers": ["programmatic"]
+			},
+			{
+				"type": "code_interpreter",
+				"container": { "type": "auto" },
+				"allowed_callers": ["direct", "programmatic"]
+			}
+		]
+	}));
+
+	let activation = prepare(
+		&mut request,
+		Some(&registry(vec![
+			tool("web_search", Some(BuiltinTool::WebSearch)),
+			tool("code_interpreter", Some(BuiltinTool::CodeInterpreter)),
+		])),
+	)
+	.expect("programmatic server tools activate the runtime");
+
+	let Activation::Active(prepared) = activation else {
+		panic!("expected active runtime");
+	};
+	let declarations = tools(&prepared.canonical_request);
+	assert_eq!(
+		declarations[0],
+		json!({
+			"type": "function",
+			"name": "_agentgateway_code_interpreter",
+			"description": "Execute Python code in an isolated sandbox and return stdout and stderr.",
+			"strict": true,
+			"parameters": super::schema::code_interpreter_parameters()
+		})
+	);
+	assert_eq!(declarations.len(), 2);
+	assert_eq!(declarations[1]["type"], "function");
+	assert_eq!(declarations[1]["name"], json!(super::PROGRAMMATIC_FUNCTION));
+	assert_eq!(
+		declarations[1]["parameters"],
+		json!({
+			"type": "object",
+			"properties": {"code": {"type": "string"}},
+			"required": ["code"],
+			"additionalProperties": false
+		})
+	);
+	let description = declarations[1]["description"].as_str().unwrap();
+	assert!(description.contains("tools.call(name, arguments)"));
+	assert!(description.contains("program_output(value)"));
+	assert!(description.contains("\"name\":\"web_search\""));
+	assert!(description.contains("\"name\":\"code_interpreter\""));
+}
+
+#[test]
+fn programmatic_model_call_collects_python_source_only() {
+	let mut request = request(json!({
+		"input": "run",
+		"tools": [
+			{"type":"web_search","allowed_callers":["programmatic"]},
+			{"type":"programmatic_tool_calling"}
+		]
+	}));
+	let Activation::Active(prepared) = prepare(
+		&mut request,
+		Some(&registry(vec![
+			tool("web_search", Some(BuiltinTool::WebSearch)),
+			tool("code_interpreter", Some(BuiltinTool::CodeInterpreter)),
+		])),
+	)
+	.unwrap() else {
+		panic!("server tool must activate the runtime");
+	};
+
+	let collected = prepared
+		.collect_model_calls(&response_with_calls(vec![function_call(
+			super::PROGRAMMATIC_FUNCTION,
+			"call_program_1",
+			r#"{"code":"program_output(tools.call('web_search', {'query':'latest'}))"}"#,
+		)]))
+		.unwrap();
+	match collected {
+		super::CollectedToolCalls::Programmatic { call_id, code } => {
+			assert_eq!(call_id, "call_program_1");
+			assert!(code.contains("tools.call('web_search'"));
+		},
+		other => panic!("expected programmatic source, got {other:?}"),
+	}
+}
+
+#[test]
+fn undeclared_programmatic_call_is_rejected_before_sandbox_execution() {
+	let mut request = request(json!({
+		"input": "search directly",
+		"tools": [{"type":"web_search"}]
+	}));
+	let Activation::Active(prepared) = prepare(
+		&mut request,
+		Some(&registry(vec![
+			tool("web_search", Some(BuiltinTool::WebSearch)),
+			tool("code_interpreter", Some(BuiltinTool::CodeInterpreter)),
+		])),
+	)
+	.unwrap() else {
+		panic!("direct Web Search must activate the runtime");
+	};
+
+	let error = prepared
+		.collect_model_calls(&response_with_calls(vec![function_call(
+			super::PROGRAMMATIC_FUNCTION,
+			"hallucinated_program",
+			r#"{"code":"program_output('not authorized')"}"#,
+		)]))
+		.expect_err("an undeclared synthetic function must be rejected");
+	assert!(error.to_string().contains("undeclared programmatic"));
+}
+
+#[test]
+fn programmatic_call_id_and_catalog_are_bounded() {
+	let mut request = request(json!({
+		"input": "run",
+		"tools": [
+			{"type":"web_search","allowed_callers":["programmatic"]},
+			{"type":"programmatic_tool_calling"}
+		]
+	}));
+	let Activation::Active(mut prepared) = prepare(
+		&mut request,
+		Some(&registry(vec![
+			tool("web_search", Some(BuiltinTool::WebSearch)),
+			tool("code_interpreter", Some(BuiltinTool::CodeInterpreter)),
+		])),
+	)
+	.unwrap() else {
+		panic!("programmatic Web Search must activate the runtime");
+	};
+
+	let error = prepared
+		.collect_model_calls(&response_with_calls(vec![function_call(
+			super::PROGRAMMATIC_FUNCTION,
+			&"x".repeat(super::SANDBOX_MAX_CALL_ID_BYTES + 1),
+			r#"{"code":"program_output(1)"}"#,
+		)]))
+		.expect_err("an oversized program call id must be rejected");
+	assert_eq!(
+		error.exhausted_limit(),
+		Some(super::ToolRuntimeLimit::SandboxCallId)
+	);
+
+	let mut oversized = HashMap::new();
+	for index in 0..513 {
+		let public_name: agent_core::prelude::Strng = format!("server.tool_{index}").into();
+		oversized.insert(
+			public_name.clone(),
+			super::ProgrammaticToolSpec {
+				public_name,
+				internal_name: super::WEB_SEARCH_FUNCTION.into(),
+				description: "d".repeat(super::remote_mcp::MAX_DESCRIPTION_BYTES),
+				input_schema: json!({"type":"object"}),
+				output_schema: None,
+			},
+		);
+	}
+	prepared.programmatic_tools = Arc::new(oversized);
+	let error = prepared
+		.refresh_programmatic_schema()
+		.expect_err("the aggregate programmatic catalog must be bounded");
+	assert!(error.to_string().contains("catalog exceeds"));
+}
+
+#[test]
+fn allowed_callers_rejects_empty_duplicate_and_unknown_values() {
+	for allowed_callers in [
+		json!([]),
+		json!(["programmatic", "programmatic"]),
+		json!(["unknown"]),
+	] {
+		let mut request = request(json!({
+			"input":"run",
+			"tools":[
+				{"type":"web_search","allowed_callers":allowed_callers},
+				{"type":"programmatic_tool_calling"}
+			]
+		}));
+		assert!(
+			prepare(
+				&mut request,
+				Some(&registry(vec![
+					tool("web_search", Some(BuiltinTool::WebSearch)),
+					tool("code_interpreter", Some(BuiltinTool::CodeInterpreter)),
+				])),
+			)
+			.is_err()
+		);
+	}
+}
+
+#[test]
+fn programmatic_only_mcp_is_added_to_python_catalog_not_direct_tools() {
+	let mut request = request(json!({
+		"input": "forecast",
+		"tools": [
+			{
+				"type":"mcp", "server_label":"weather",
+				"server_url":"https://weather.example/mcp",
+				"allowed_tools":["get_forecast"],
+				"allowed_callers":["programmatic"],
+				"require_approval":"never"
+			},
+			{"type":"programmatic_tool_calling"}
+		]
+	}));
+	let Activation::Active(mut prepared) = prepare(
+		&mut request,
+		Some(&registry(vec![tool(
+			"code_interpreter",
+			Some(BuiltinTool::CodeInterpreter),
+		)])),
+	)
+	.unwrap() else {
+		panic!("programmatic MCP must activate the runtime");
+	};
+	prepared
+		.install_remote_mcp_tools_for_test(
+			0,
+			Arc::new(BatchBackend),
+			vec![super::RemoteMcpTool {
+				remote_name: "get_forecast".into(),
+				description: Some("Get a weather forecast".into()),
+				input_schema: json!({
+					"type":"object",
+					"properties":{"q":{"type":"string"},"days":{"type":"integer"}},
+					"required":["q","days"],
+					"additionalProperties":false
+				}),
+				output_schema: Some(json!({
+					"type":"object",
+					"properties": {
+						"forecast": {
+							"type":"object",
+							"properties": {
+								"forecastday": {
+									"type":"array",
+									"items": {
+										"type":"object",
+										"properties": {"mintemp_c":{"type":"number"}}
+									}
+								}
+							}
+						}
+					},
+					"required":["forecast"]
+				})),
+			}],
+		)
+		.unwrap();
+
+	let declarations = tools(&prepared.canonical_request);
+	assert_eq!(declarations.len(), 1);
+	assert_eq!(declarations[0]["name"], super::PROGRAMMATIC_FUNCTION);
+	let description = declarations[0]["description"].as_str().unwrap();
+	assert!(description.contains("output_schema describes the structuredContent field"));
+	assert!(description.contains("\"name\":\"weather.get_forecast\""));
+	assert!(description.contains("\"output_schema\":{"));
+	assert!(description.contains("\"mintemp_c\":{\"type\":\"number\"}"));
+	assert!(!description.contains("_agentgateway_mcp_0_0"));
+}
+
+#[test]
+fn programmatic_mcp_catalog_is_bounded_during_incremental_installation() {
+	let mut declarations = (0..5)
+		.map(|index| {
+			json!({
+				"type":"mcp",
+				"server_label":format!("weather_{index}"),
+				"server_url":format!("https://weather-{index}.example/mcp"),
+				"allowed_callers":["programmatic"],
+				"require_approval":"never"
+			})
+		})
+		.collect::<Vec<_>>();
+	declarations.push(json!({"type":"programmatic_tool_calling"}));
+	let mut request = request(json!({"input":"forecast","tools":declarations}));
+	let Activation::Active(mut prepared) = prepare(
+		&mut request,
+		Some(&registry(vec![tool(
+			"code_interpreter",
+			Some(BuiltinTool::CodeInterpreter),
+		)])),
+	)
+	.unwrap() else {
+		panic!("programmatic MCP must activate the runtime");
+	};
+
+	let mut rejected = None;
+	for server_index in 0..5 {
+		let tools = (0..super::remote_mcp::MAX_DISCOVERED_TOOLS)
+			.map(|tool_index| super::RemoteMcpTool {
+				remote_name: format!("forecast_{tool_index}"),
+				description: Some("d".repeat(super::remote_mcp::MAX_DESCRIPTION_BYTES)),
+				input_schema: json!({"type":"object"}),
+				output_schema: None,
+			})
+			.collect();
+		if let Err(error) =
+			prepared.install_remote_mcp_tools(server_index, Arc::new(BatchBackend), tools)
+		{
+			rejected = Some(error);
+			break;
+		}
+	}
+	let error = rejected.expect("aggregate catalog growth must be rejected during installation");
+	assert!(error.to_string().contains("catalog exceeds"));
+	assert!(
+		prepared.programmatic_catalog_bytes <= super::PROGRAMMATIC_MAX_CATALOG_BYTES,
+		"catalog accounting exceeded its hard bound"
+	);
+	assert!(
+		prepared.programmatic_tools.len() < 5 * super::remote_mcp::MAX_DISCOVERED_TOOLS,
+		"the overflowing tool was inserted before rejection"
 	);
 }
 
@@ -1989,6 +2421,29 @@ impl ToolBackend for BatchBackend {
 				.map(|call| ToolExecutionResult::function(json!({"call": call.call_id})))
 				.collect(),
 		))
+	}
+}
+
+struct FakeProgramSandbox;
+
+#[async_trait::async_trait]
+impl ProgramSandbox for FakeProgramSandbox {
+	async fn run(
+		&self,
+		_request: ProgramSandboxRequest,
+		_context: ToolExecutionContext,
+	) -> Result<ProgramSandboxExecution, ToolBatchInfrastructureError> {
+		Ok(ProgramSandboxExecution {
+			result: ToolExecutionResult::python(json!({
+				"exit_code":0,
+				"stdout":"protocol\n",
+				"stderr":"",
+				"timed_out":false,
+				"truncated":false,
+				"artifacts":[]
+			})),
+			metadata: ToolBatchMetadata::default(),
+		})
 	}
 }
 
@@ -2677,6 +3132,40 @@ fn controlled_budget(
 	)
 }
 
+#[tokio::test]
+async fn program_sandbox_execution_does_not_consume_tool_call_budget() {
+	let registry = controlled_registry(
+		runtime_limits(1, 1, Duration::from_secs(5)),
+		&["managed"],
+		true,
+	);
+	let mut budget = RuntimeBudget::with_test_backends_and_program_sandbox(
+		&registry,
+		HashMap::from([(
+			"managed".to_owned(),
+			Arc::new(BatchBackend) as Arc<dyn ToolBackend>,
+		)]),
+		Arc::new(FakeProgramSandbox),
+	);
+	budget
+		.execute_program_sandbox(ProgramSandboxRequest {
+			source: "pass".into(),
+			env_vars: Default::default(),
+		})
+		.await
+		.unwrap();
+	execute_batch(
+		&registry,
+		vec![managed_call("managed", "call_1", json!({}))],
+		false,
+		&mut budget,
+	)
+	.await
+	.unwrap();
+	assert_eq!(budget.tool_calls(), 1);
+	assert_eq!(budget.program_sandbox_executions(), 1);
+}
+
 struct FakeResponsesRoundTrip {
 	rounds: VecDeque<super::runner::ModelRound>,
 	requests: Vec<Value>,
@@ -2702,6 +3191,573 @@ fn successful_model_round(output: Vec<Value>) -> super::runner::ModelRound {
 		raw_output: output,
 		reconstructed_upstream: crate::http::Response::new(crate::http::Body::empty()),
 	}))
+}
+
+struct ReplayProgramState {
+	outcomes: Mutex<VecDeque<Value>>,
+	replay_lengths: Mutex<Vec<usize>>,
+	replays: Mutex<Vec<Value>>,
+}
+
+struct ReplayProgramSandbox {
+	state: Arc<ReplayProgramState>,
+}
+
+struct LargeProgramToolBackend {
+	calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ToolBackend for LargeProgramToolBackend {
+	async fn execute_batch(
+		&self,
+		calls: Vec<ManagedToolCall>,
+		_context: ToolExecutionContext,
+	) -> Result<ToolBatchExecution, ToolBatchInfrastructureError> {
+		self.calls.fetch_add(calls.len(), Ordering::SeqCst);
+		Ok(ToolBatchExecution::new(
+			calls
+				.into_iter()
+				.map(|_| ToolExecutionResult::function(json!({"result":"x".repeat(4050)})))
+				.collect(),
+		))
+	}
+}
+
+#[async_trait::async_trait]
+impl ProgramSandbox for ReplayProgramSandbox {
+	async fn run(
+		&self,
+		request: ProgramSandboxRequest,
+		_context: ToolExecutionContext,
+	) -> Result<ProgramSandboxExecution, ToolBatchInfrastructureError> {
+		let nonce = request.env_vars["AGENTGATEWAY_PTC_NONCE"].as_str().unwrap();
+		let replay = request.env_vars["AGENTGATEWAY_PTC_REPLAY"]
+			.as_str()
+			.unwrap();
+		let replay: Value = serde_json::from_slice(
+			&base64::engine::general_purpose::STANDARD
+				.decode(replay)
+				.unwrap(),
+		)
+		.unwrap();
+		self
+			.state
+			.replay_lengths
+			.lock()
+			.unwrap()
+			.push(replay.as_array().unwrap().len());
+		self.state.replays.lock().unwrap().push(replay);
+		let payload = self.state.outcomes.lock().unwrap().pop_front().unwrap();
+		let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+			.encode(serde_json::to_vec(&payload).unwrap());
+		Ok(ProgramSandboxExecution {
+			result: ToolExecutionResult::python(json!({
+				"exit_code":0,
+				"stdout":format!("__AGENTGATEWAY_PTC_V1__{nonce}:{payload}\n"),
+				"stderr":"",
+				"timed_out":false,
+				"truncated":false,
+				"artifacts":[]
+			})),
+			metadata: ToolBatchMetadata::default(),
+		})
+	}
+}
+
+#[tokio::test]
+async fn runner_replays_python_until_program_output() {
+	let mut client_request = request(json!({
+		"input": "research",
+		"tools": [
+			{ "type": "programmatic_tool_calling" },
+			{ "type": "web_search", "allowed_callers": ["programmatic"] },
+			{
+				"type": "code_interpreter",
+				"container": {"type":"auto"},
+				"allowed_callers": ["programmatic"]
+			}
+		]
+	}));
+	let Activation::Active(runtime) = prepare(
+		&mut client_request,
+		Some(&registry(vec![
+			tool("web_search", Some(BuiltinTool::WebSearch)),
+			tool("code_interpreter", Some(BuiltinTool::CodeInterpreter)),
+		])),
+	)
+	.unwrap() else {
+		panic!("programmatic web search must activate the runtime");
+	};
+	let state = Arc::new(ReplayProgramState {
+		outcomes: Mutex::new(VecDeque::from([
+			json!({
+				"version":1,"kind":"pending","sequence":0,"name":"web_search",
+				"arguments":{"query":"latest"}
+			}),
+			json!({
+				"version":1,"kind":"pending","sequence":1,"name":"code_interpreter",
+				"arguments":{"code":"29 * 31"}
+			}),
+			json!({
+				"version":1,"kind":"completed",
+				"output":{"fact":"open source gateway","product":899}
+			}),
+		])),
+		replay_lengths: Mutex::new(Vec::new()),
+		replays: Mutex::new(Vec::new()),
+	});
+	let budget = RuntimeBudget::with_test_backends_and_program_sandbox(
+		&runtime.registry,
+		HashMap::from([
+			(
+				super::WEB_SEARCH_FUNCTION.to_owned(),
+				Arc::new(BatchBackend) as Arc<dyn ToolBackend>,
+			),
+			(
+				super::CODE_INTERPRETER_FUNCTION.to_owned(),
+				Arc::new(BatchBackend) as Arc<dyn ToolBackend>,
+			),
+		]),
+		Arc::new(ReplayProgramSandbox {
+			state: state.clone(),
+		}),
+	);
+	let mut round_trip = FakeResponsesRoundTrip {
+		rounds: VecDeque::from([
+			successful_model_round(vec![function_call(
+				super::PROGRAMMATIC_FUNCTION,
+				"call_program_1",
+				r#"{"code":"fact = tools.call('web_search', {'query':'latest'})\nproduct = tools.call('code_interpreter', {'code':'29 * 31'})\nprogram_output({'fact':fact,'product':product})"}"#,
+			)]),
+			successful_model_round(vec![json!({
+				"type": "message",
+				"id": "msg_final",
+				"role": "assistant",
+				"status": "completed",
+				"content": []
+			})]),
+		]),
+		requests: Vec::new(),
+	};
+
+	let result = super::runner::run(runtime, budget, &mut round_trip)
+		.await
+		.expect("programmatic tool loop completes");
+
+	assert!(matches!(
+		result.response.output.as_slice(),
+		[responses::typed::OutputItem::Message(_)]
+	));
+	let continued_input = round_trip.requests[1]["input"].as_array().unwrap();
+	let output = continued_input
+		.iter()
+		.find(|item| item["type"] == "function_call_output")
+		.expect("function output is replayed");
+	assert_eq!(output["call_id"], "call_program_1");
+	let program: Value = serde_json::from_str(output["output"].as_str().unwrap()).unwrap();
+	assert_eq!(
+		program,
+		json!({
+			"ok":true,
+			"result":{"fact":"open source gateway","product":899}
+		})
+	);
+	assert_eq!(*state.replay_lengths.lock().unwrap(), vec![0, 1, 2]);
+	assert_eq!(result.summary.tool_calls, 2);
+}
+
+#[tokio::test]
+async fn runner_fits_nested_output_into_replay_after_tool_execution() {
+	let mut client_request = request(json!({
+		"input":"run",
+		"tools":[
+			{
+				"type":"code_interpreter",
+				"container":{"type":"auto"},
+				"allowed_callers":["programmatic"]
+			},
+			{"type":"programmatic_tool_calling"}
+		]
+	}));
+	let configured = controlled_registry(
+		RuntimeLimits {
+			max_output_bytes: 512,
+			..runtime_limits(2, 1, Duration::from_secs(5))
+		},
+		&[],
+		true,
+	);
+	let Activation::Active(runtime) = prepare(&mut client_request, Some(&configured)).unwrap() else {
+		panic!("programmatic Code Interpreter must activate the runtime");
+	};
+	let state = Arc::new(ReplayProgramState {
+		outcomes: Mutex::new(VecDeque::from([
+			json!({
+				"version":1,"kind":"pending","sequence":0,"name":"code_interpreter",
+				"arguments":{"code":"perform_side_effect()"}
+			}),
+			json!({
+				"version":1,"kind":"pending","sequence":1,"name":"code_interpreter",
+				"arguments":{"code":"perform_second_side_effect()"}
+			}),
+		])),
+		replay_lengths: Mutex::new(Vec::new()),
+		replays: Mutex::new(Vec::new()),
+	});
+	let backend_calls = Arc::new(AtomicUsize::new(0));
+	let budget = RuntimeBudget::with_test_backends_and_program_sandbox(
+		&runtime.registry,
+		HashMap::from([(
+			super::CODE_INTERPRETER_FUNCTION.to_owned(),
+			Arc::new(LargeProgramToolBackend {
+				calls: backend_calls.clone(),
+			}) as Arc<dyn ToolBackend>,
+		)]),
+		Arc::new(ReplayProgramSandbox {
+			state: state.clone(),
+		}),
+	);
+	let mut round_trip = FakeResponsesRoundTrip {
+		rounds: VecDeque::from([
+			successful_model_round(vec![function_call(
+				super::PROGRAMMATIC_FUNCTION,
+				"call_large_replay",
+				r#"{"code":"value = tools.call('code_interpreter', {'code':'perform_side_effect()'})\nprogram_output(value)"}"#,
+			)]),
+			successful_model_round(vec![json!({
+				"type":"message", "id":"msg_final", "role":"assistant",
+				"status":"completed", "content":[]
+			})]),
+		]),
+		requests: Vec::new(),
+	};
+
+	super::runner::run(runtime, budget, &mut round_trip)
+		.await
+		.expect("large nested output is replayed without a post-execution request failure");
+
+	let replays = state.replays.lock().unwrap();
+	assert_eq!(replays.len(), 2);
+	assert_eq!(replays[1][0]["output"]["ok"], true);
+	assert_eq!(replays[1][0]["output"]["truncated"], true);
+	assert!(serde_json::to_vec(&replays[1]).unwrap().len() <= 512);
+	assert_eq!(backend_calls.load(Ordering::SeqCst), 1);
+	let continuation = round_trip.requests[1]["input"].as_array().unwrap();
+	let output = continuation
+		.iter()
+		.find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_large_replay")
+		.unwrap();
+	let output: Value = serde_json::from_str(output["output"].as_str().unwrap()).unwrap();
+	assert_eq!(output["ok"], false);
+	assert_eq!(output["error"]["type"], "program_replay_limit");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runner_debug_logs_do_not_include_generated_program_source() {
+	#[derive(Clone)]
+	struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+	impl std::io::Write for LogWriter {
+		fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+			self.0.lock().unwrap().extend_from_slice(buffer);
+			Ok(buffer.len())
+		}
+
+		fn flush(&mut self) -> std::io::Result<()> {
+			Ok(())
+		}
+	}
+
+	const PRIVATE_PROGRAM: &str = "program_output('customer-private-value')";
+	let mut client_request = request(json!({
+		"input":"run",
+		"tools":[
+			{
+				"type":"code_interpreter",
+				"container":{"type":"auto"},
+				"allowed_callers":["programmatic"]
+			},
+			{"type":"programmatic_tool_calling"}
+		]
+	}));
+	let configured = controlled_registry(runtime_limits(1, 1, Duration::from_secs(5)), &[], true);
+	let Activation::Active(runtime) = prepare(&mut client_request, Some(&configured)).unwrap() else {
+		panic!("programmatic Code Interpreter must activate the runtime");
+	};
+	let state = Arc::new(ReplayProgramState {
+		outcomes: Mutex::new(VecDeque::from([json!({
+			"version":1,"kind":"completed","output":"done"
+		})])),
+		replay_lengths: Mutex::new(Vec::new()),
+		replays: Mutex::new(Vec::new()),
+	});
+	let budget = RuntimeBudget::with_test_backends_and_program_sandbox(
+		&runtime.registry,
+		HashMap::new(),
+		Arc::new(ReplayProgramSandbox { state }),
+	);
+	let mut round_trip = FakeResponsesRoundTrip {
+		rounds: VecDeque::from([
+			successful_model_round(vec![function_call(
+				super::PROGRAMMATIC_FUNCTION,
+				"call_private_program",
+				&serde_json::to_string(&json!({"code":PRIVATE_PROGRAM})).unwrap(),
+			)]),
+			successful_model_round(vec![json!({
+				"type":"message", "id":"msg_final", "role":"assistant",
+				"status":"completed", "content":[]
+			})]),
+		]),
+		requests: Vec::new(),
+	};
+	let logs = Arc::new(Mutex::new(Vec::new()));
+	let writer = LogWriter(logs.clone());
+	let subscriber = tracing_subscriber::fmt()
+		.with_ansi(false)
+		.without_time()
+		.with_max_level(tracing::Level::DEBUG)
+		.with_writer(move || writer.clone())
+		.finish();
+	let _guard = tracing::subscriber::set_default(subscriber);
+
+	super::runner::run(runtime, budget, &mut round_trip)
+		.await
+		.expect("program completes");
+
+	let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+	assert!(
+		logs.contains("generated programmatic tool call code"),
+		"{logs}"
+	);
+	assert!(
+		!logs.contains(PRIVATE_PROGRAM),
+		"debug logs leaked program source: {logs}"
+	);
+}
+
+#[tokio::test]
+async fn runner_terminates_on_program_replay_contract_error() {
+	let mut client_request = request(json!({
+		"input":"run",
+		"tools":[
+			{"type":"web_search","allowed_callers":["programmatic"]},
+			{"type":"programmatic_tool_calling"}
+		]
+	}));
+	let Activation::Active(runtime) = prepare(
+		&mut client_request,
+		Some(&registry(vec![
+			tool("web_search", Some(BuiltinTool::WebSearch)),
+			tool("code_interpreter", Some(BuiltinTool::CodeInterpreter)),
+		])),
+	)
+	.unwrap() else {
+		panic!("programmatic Web Search must activate the runtime");
+	};
+	let state = Arc::new(ReplayProgramState {
+		outcomes: Mutex::new(VecDeque::from([json!({
+			"version":1,
+			"kind":"contract_error",
+			"message":"program replay diverged from the authorized transcript"
+		})])),
+		replay_lengths: Mutex::new(Vec::new()),
+		replays: Mutex::new(Vec::new()),
+	});
+	let budget = RuntimeBudget::with_test_backends_and_program_sandbox(
+		&runtime.registry,
+		HashMap::from([(
+			super::WEB_SEARCH_FUNCTION.to_owned(),
+			Arc::new(BatchBackend) as Arc<dyn ToolBackend>,
+		)]),
+		Arc::new(ReplayProgramSandbox {
+			state: state.clone(),
+		}),
+	);
+	let mut round_trip = FakeResponsesRoundTrip {
+		rounds: VecDeque::from([successful_model_round(vec![function_call(
+			super::PROGRAMMATIC_FUNCTION,
+			"call_contract_error",
+			r#"{"code":"program_output(1)"}"#,
+		)])]),
+		requests: Vec::new(),
+	};
+
+	let error = match super::runner::run(runtime, budget, &mut round_trip).await {
+		Ok(_) => panic!("a replay contract error must terminate the managed request"),
+		Err(error) => error,
+	};
+	let super::runner::RunError::Runtime(error) = error else {
+		panic!("expected a runtime contract error: {error:?}");
+	};
+	assert!(error.to_string().contains("replay contract failed"));
+	assert_eq!(round_trip.requests.len(), 1);
+	assert_eq!(*state.replay_lengths.lock().unwrap(), vec![0]);
+}
+
+#[derive(Default)]
+struct WeatherMcpState {
+	calls: Mutex<Vec<(String, Value, Value)>>,
+}
+
+struct WeatherMcpBackend {
+	state: Arc<WeatherMcpState>,
+}
+
+#[async_trait::async_trait]
+impl ToolBackend for WeatherMcpBackend {
+	async fn execute_batch(
+		&self,
+		calls: Vec<ManagedToolCall>,
+		_context: ToolExecutionContext,
+	) -> Result<ToolBatchExecution, ToolBatchInfrastructureError> {
+		let results = calls
+			.into_iter()
+			.map(|call| {
+				self.state.calls.lock().unwrap().push((
+					call.public_name.to_string(),
+					call.arguments,
+					call.trusted_options,
+				));
+				ToolExecutionResult::function(json!({
+					"content": [{
+						"type": "text",
+						"text": serde_json::to_string(&json!({
+							"forecast": {"forecastday": [
+								{"date":"2026-08-27","day":{"mintemp_c":26.6,"maxtemp_c":33.5}},
+								{"date":"2026-08-28","day":{"mintemp_c":25.9,"maxtemp_c":30.4}},
+								{"date":"2026-08-29","day":{"mintemp_c":26.8,"maxtemp_c":32.4}}
+							]}
+						})).unwrap()
+					}],
+					"isError": false
+				}))
+			})
+			.collect();
+		Ok(ToolBatchExecution::new(results))
+	}
+}
+
+#[tokio::test]
+async fn runner_replays_programmatic_weather_mcp_three_day_forecast() {
+	let mut client_request = request(json!({
+		"input": "forecast",
+		"tools": [
+			{
+				"type":"mcp", "server_label":"weather",
+				"server_url":"https://weather.example/mcp",
+				"allowed_tools":["get_forecast"],
+				"allowed_callers":["programmatic"],
+				"require_approval":"never"
+			},
+			{"type":"programmatic_tool_calling"}
+		]
+	}));
+	let Activation::Active(mut runtime) = prepare(
+		&mut client_request,
+		Some(&registry(vec![tool(
+			"code_interpreter",
+			Some(BuiltinTool::CodeInterpreter),
+		)])),
+	)
+	.unwrap() else {
+		panic!("programmatic MCP must activate the runtime");
+	};
+	let weather_state = Arc::new(WeatherMcpState::default());
+	runtime
+		.install_remote_mcp_tools_for_test(
+			0,
+			Arc::new(WeatherMcpBackend {
+				state: weather_state.clone(),
+			}),
+			vec![super::RemoteMcpTool {
+				remote_name: "get_forecast".into(),
+				description: Some("Get a three-day weather forecast".into()),
+				input_schema: json!({
+					"type":"object",
+					"properties":{"q":{"type":"string"},"days":{"type":"integer"}},
+					"required":["q","days"],
+					"additionalProperties":false
+				}),
+				output_schema: None,
+			}],
+		)
+		.unwrap();
+
+	let forecast = json!([
+		{"date":"2026-08-27","min_c":26.6,"max_c":33.5},
+		{"date":"2026-08-28","min_c":25.9,"max_c":30.4},
+		{"date":"2026-08-29","min_c":26.8,"max_c":32.4}
+	]);
+	let program_state = Arc::new(ReplayProgramState {
+		outcomes: Mutex::new(VecDeque::from([
+			json!({
+				"version":1,"kind":"pending","sequence":0,
+				"name":"weather.get_forecast",
+				"arguments":{"q":"Shanghai","days":3}
+			}),
+			json!({"version":1,"kind":"completed","output":forecast}),
+		])),
+		replay_lengths: Mutex::new(Vec::new()),
+		replays: Mutex::new(Vec::new()),
+	});
+	let budget = RuntimeBudget::with_test_backends_and_program_sandbox(
+		&runtime.registry,
+		HashMap::from([(
+			"_agentgateway_mcp_0_0".to_owned(),
+			Arc::new(WeatherMcpBackend {
+				state: weather_state.clone(),
+			}) as Arc<dyn ToolBackend>,
+		)]),
+		Arc::new(ReplayProgramSandbox {
+			state: program_state.clone(),
+		}),
+	);
+	let mut round_trip = FakeResponsesRoundTrip {
+		rounds: VecDeque::from([
+			successful_model_round(vec![function_call(
+				super::PROGRAMMATIC_FUNCTION,
+				"call_weather_program_1",
+				r#"{"code":"forecast = tools.call('weather.get_forecast', {'q':'Shanghai','days':3})\nprogram_output(forecast)"}"#,
+			)]),
+			successful_model_round(vec![json!({
+				"type":"message", "id":"msg_weather_final", "role":"assistant",
+				"status":"completed", "content":[]
+			})]),
+		]),
+		requests: Vec::new(),
+	};
+
+	let result = super::runner::run(runtime, budget, &mut round_trip)
+		.await
+		.expect("programmatic weather MCP loop completes");
+
+	assert!(matches!(
+		result.response.output.as_slice(),
+		[responses::typed::OutputItem::Message(_)]
+	));
+	assert_eq!(result.summary.tool_calls, 1);
+	assert_eq!(*program_state.replay_lengths.lock().unwrap(), vec![0, 1]);
+	let calls = weather_state.calls.lock().unwrap();
+	assert_eq!(calls.len(), 1);
+	assert_eq!(calls[0].0, "weather.get_forecast");
+	assert_eq!(calls[0].1, json!({"q":"Shanghai","days":3}));
+	assert_eq!(calls[0].2["remote_tool_name"], "get_forecast");
+	drop(calls);
+	let replays = program_state.replays.lock().unwrap();
+	assert_eq!(replays[1][0]["name"], "weather.get_forecast");
+	assert_eq!(replays[1][0]["arguments"], json!({"q":"Shanghai","days":3}));
+	assert_eq!(replays[1][0]["output"]["ok"], true);
+	assert_eq!(replays[1][0]["output"]["content"][0]["type"], "text");
+	drop(replays);
+	let continued_input = round_trip.requests[1]["input"].as_array().unwrap();
+	let output = continued_input
+		.iter()
+		.find(|item| item["type"] == "function_call_output")
+		.unwrap();
+	let program: Value = serde_json::from_str(output["output"].as_str().unwrap()).unwrap();
+	assert_eq!(program["ok"], true);
+	assert_eq!(program["result"], forecast);
 }
 
 #[tokio::test]
