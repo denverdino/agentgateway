@@ -55,4 +55,13 @@
 | --- | --- | --- | --- |
 | `agentgateway_build_info` | Info | — | Agentgateway build information. |
 | `agentgateway_config_synchronized` | Gauge | — | Whether the last configuration load/reload was successful or not, being synchronized with the on-disk configuration. |
+| `agentgateway_tool_runtime_call_duration_seconds` | Histogram | seconds | Duration of managed Responses tool calls (seconds). |
+| `agentgateway_tool_runtime_calls_total` | Counter | — | Total managed Responses tool calls by configured tool, backend, and outcome. |
+| `agentgateway_tool_runtime_limit_exhaustions_total` | Counter | — | Total managed tool runtime limit exhaustions by closed limit kind. |
+| `agentgateway_tool_runtime_model_round_duration_seconds` | Histogram | seconds | Duration of managed Responses tool runtime model rounds (seconds). |
+| `agentgateway_tool_runtime_model_rounds_total` | Counter | — | Total model rounds in the managed Responses tool runtime by outcome. |
+| `agentgateway_tool_runtime_output_truncations_total` | Counter | — | Total managed tool outputs truncated by configured tool. |
+| `agentgateway_tool_runtime_requests_total` | Counter | — | Total managed Responses tool runtime requests by final outcome. |
+| `agentgateway_tool_runtime_sandbox_operation_duration_seconds` | Histogram | seconds | Duration of bounded Sandbox operations (seconds). |
+| `agentgateway_tool_runtime_sandbox_operations_total` | Counter | — | Total bounded Sandbox operations by operation and outcome. |
 | `agentgateway_upstream_call_duration_seconds` | Histogram | seconds | Duration of outbound calls made by agentgateway (seconds). |

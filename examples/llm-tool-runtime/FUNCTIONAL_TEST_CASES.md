@@ -4,8 +4,8 @@ The release-binary harness is
 [`functional_test.py`](functional_test.py). It launches the requested
 `agentgateway` executable with ephemeral loopback ports and a temporary config,
 waits for readiness, and sends requests only through public
-`/v1/responses`. Its model, Web Search, and Sandbox endpoints are local mocks;
-no cloud credential is required.
+`/v1/responses`. Its model, Web Search, Sandbox, and managed HTTP tool endpoints
+are local mocks; no cloud credential is required.
 
 Run all harness cases or select repeatable cases by name:
 
@@ -39,6 +39,7 @@ python3 examples/llm-tool-runtime/functional_test.py \
 | HTTP 504 absolute model-body timeout | Not in the release harness; hermetic Rust | `responses_managed_tool_runtime_deadline_covers_body_after_headers` | Headers do not reset the deadline. A stalled/periodic body cannot extend it; response is sanitized 504 and no tool starts. |
 | HTTP 504 absolute tool timeout | Not in the release harness; hermetic Rust | `responses_managed_tool_runtime_absolute_deadline_includes_tool_time` | Tool time consumes the same absolute request budget; expiry is sanitized 504, later model rounds do not start, sibling work is cancelled, and cleanup/terminal telemetry is bounded once. |
 | Unmanaged function single-call passthrough | `unmanaged-function-passthrough` | Rust regression | HTTP 200 contains the upstream `client_owned` function call and stable `client-call-1`; exactly one model request receives the declaration unchanged; zero Web Search or Sandbox requests. |
+| Gateway-executed Tool Search over a deferred tool | `tool-search-deferred` | Rust unit and hermetic proxy coverage | Exactly three model rounds. Round one declares only `_agentgateway_tool_search`, whose description indexes `catalog_lookup` without declaring it. The searched declaration is appended after the search function in round two, so the cached prefix is preserved. The model then calls `catalog_lookup` once; the catalog backend receives exactly one request; aggregate usage is `21/9/30`; only the final message is returned and no reserved `_agentgateway` name reaches the client; the echoed `tools` array equals the client's original array including `defer_loading`. |
 
 ## Detailed acceptance invariants
 

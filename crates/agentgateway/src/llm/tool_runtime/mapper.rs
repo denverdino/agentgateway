@@ -11,9 +11,9 @@ use super::remote_mcp::{
 };
 use super::schema::{ArgumentSchema, code_interpreter_parameters, web_search_parameters};
 use super::{
-	Activation, AllowedCaller, AllowedCallers, CODE_INTERPRETER_FUNCTION, PreparedToolRuntime,
-	ProgrammaticToolSpec, RemoteMcpServer, ResponsesRequestExt, ToolRegistry, ToolRuntimeError,
-	WEB_SEARCH_FUNCTION,
+	Activation, AllowedCaller, AllowedCallers, CODE_INTERPRETER_FUNCTION, DeferredTool,
+	MAX_DEFERRED_TOOLS, PreparedToolRuntime, ProgrammaticToolSpec, RemoteMcpServer,
+	ResponsesRequestExt, ToolRegistry, ToolRuntimeError, ToolSearchState, WEB_SEARCH_FUNCTION,
 };
 use crate::llm::types::responses;
 
@@ -32,12 +32,14 @@ pub(crate) fn prepare(
 	let mut builtin_present = false;
 	let mut remote_mcp_present = false;
 	let mut programmatic_requested = false;
+	let mut tool_search_requested = false;
 	let mut seen_mcp_labels = HashSet::new();
 	let mut pending_remote_mcp = Vec::new();
 	let mut rewritten = Vec::with_capacity(declarations.len());
 	let mut trusted_options = HashMap::new();
 	let mut argument_schemas = HashMap::new();
 	let mut programmatic_tools = Vec::new();
+	let mut deferred_tools = Vec::new();
 
 	for declaration in declarations {
 		let kind = declaration
@@ -59,39 +61,88 @@ pub(crate) fn prepare(
 				}
 				programmatic_requested = true;
 			},
+			"tool_search" => {
+				if !seen_builtin_types.insert(kind.to_owned()) {
+					return Err(ToolRuntimeError::invalid_request(format!(
+						"duplicate tool declaration for {kind}"
+					)));
+				}
+				if declaration
+					.as_object()
+					.is_some_and(|value| value.len() != 1)
+				{
+					return Err(ToolRuntimeError::invalid_request(
+						"tool_search may be declared once without options",
+					));
+				}
+				if registry.is_none() {
+					return Err(ToolRuntimeError::invalid_request(
+						"tool_search requires llm.toolRuntime configuration",
+					));
+				}
+				tool_search_requested = true;
+			},
 			"function" => {
-				let name = declaration
-					.get("name")
-					.and_then(Value::as_str)
-					.ok_or_else(|| {
-						ToolRuntimeError::invalid_request("function tool requires a string name")
+				let mut target = FunctionTarget {
+					seen_function_names: &mut seen_function_names,
+					function_names: &mut function_names,
+					managed_function_present: &mut managed_function_present,
+					argument_schemas: &mut argument_schemas,
+					deferred_tools: &mut deferred_tools,
+					rewritten: &mut rewritten,
+				};
+				accept_function_declaration(&mut target, registry, declaration, None, false)?;
+			},
+			// A namespace declaration must never reach the model: `collect_model_calls` rejects any call
+			// carrying a namespace. Flatten it into its member functions and keep the namespace name only
+			// as search text.
+			"namespace" => {
+				let namespace: NamespaceDeclaration =
+					serde_json::from_value(declaration).map_err(|error| {
+						ToolRuntimeError::invalid_request(format!("invalid namespace declaration: {error}"))
 					})?;
-				if name.starts_with(RESERVED_PREFIX) {
-					return Err(ToolRuntimeError::invalid_request(format!(
-						"function tool name {name} uses the reserved _agentgateway_ namespace"
-					)));
+				if namespace.name.is_empty() || namespace.name.len() > MAX_TOOL_NAME_BYTES {
+					return Err(ToolRuntimeError::invalid_request(
+						"namespace name must contain 1 to 128 bytes",
+					));
 				}
-				if !seen_function_names.insert(name.to_owned()) {
-					return Err(ToolRuntimeError::invalid_request(format!(
-						"duplicate tool declaration for function {name}"
-					)));
+				if namespace.tools.is_empty() {
+					return Err(ToolRuntimeError::invalid_request(
+						"namespace must declare at least one tool",
+					));
 				}
-				if registry.is_some_and(|registry| registry.resolves_function(name)) {
-					managed_function_present = true;
-					let parameters = declaration.get("parameters").ok_or_else(|| {
-						ToolRuntimeError::invalid_request(
-							"managed function parameters must be a valid JSON Schema",
-						)
-					})?;
-					let schema = ArgumentSchema::compile(parameters).map_err(|()| {
-						ToolRuntimeError::invalid_request(
-							"managed function parameters must be a valid JSON Schema",
-						)
-					})?;
-					argument_schemas.insert(Strng::from(name), schema);
+				let defer_loading = namespace.defer_loading.unwrap_or(false);
+				for mut tool in namespace.tools {
+					// Compose the namespace context into the member description, the same way a remote MCP
+					// server label and description are composed onto its tools.
+					if let Some(namespace_description) = namespace.description.as_deref()
+						&& let Some(tool) = tool.as_object_mut()
+					{
+						let composed = match tool.get("description").and_then(Value::as_str) {
+							Some(description) => format!(
+								"[{}] {namespace_description}\n\n{description}",
+								namespace.name
+							),
+							None => format!("[{}] {namespace_description}", namespace.name),
+						};
+						tool.insert("description".to_owned(), Value::String(composed));
+					}
+					let mut target = FunctionTarget {
+						seen_function_names: &mut seen_function_names,
+						function_names: &mut function_names,
+						managed_function_present: &mut managed_function_present,
+						argument_schemas: &mut argument_schemas,
+						deferred_tools: &mut deferred_tools,
+						rewritten: &mut rewritten,
+					};
+					accept_function_declaration(
+						&mut target,
+						registry,
+						tool,
+						Some(namespace.name.as_str()),
+						defer_loading,
+					)?;
 				}
-				function_names.push(name.to_owned());
-				rewritten.push(declaration);
 			},
 			"web_search" => {
 				if !seen_builtin_types.insert(kind.to_owned()) {
@@ -156,13 +207,45 @@ pub(crate) fn prepare(
 				pending_remote_mcp.push(server);
 				remote_mcp_present = true;
 			},
-			_ => rewritten.push(declaration),
+			// The gateway consumes the `tool_search` declaration, so a passthrough type that kept
+			// `defer_loading` would reach the provider with nothing to satisfy it, and the gateway holds no
+			// catalog entry to search it back into context.
+			_ => {
+				if declaration
+					.get("defer_loading")
+					.and_then(Value::as_bool)
+					.unwrap_or(false)
+				{
+					return Err(ToolRuntimeError::invalid_request(format!(
+						"defer_loading is only supported on function, mcp and namespace tools, not {kind}"
+					)));
+				}
+				rewritten.push(declaration)
+			},
 		}
 	}
 
-	if !managed_function_present && !builtin_present && !remote_mcp_present && !programmatic_requested
+	if !managed_function_present
+		&& !builtin_present
+		&& !remote_mcp_present
+		&& !programmatic_requested
+		&& !tool_search_requested
 	{
 		return Ok(Activation::Inactive);
+	}
+	if !tool_search_requested
+		&& (!deferred_tools.is_empty() || pending_remote_mcp.iter().any(|server| server.defer_loading))
+	{
+		return Err(ToolRuntimeError::invalid_request(
+			"defer_loading requires a tool_search declaration",
+		));
+	}
+	if let Some(forced) = forced_function_name(request)
+		&& deferred_tools.iter().any(|tool| tool.public_name == forced)
+	{
+		return Err(ToolRuntimeError::invalid_request(format!(
+			"tool_choice cannot force the deferred function {forced}"
+		)));
 	}
 	if programmatic_requested
 		&& !registry.is_some_and(|registry| registry.has_internal(CODE_INTERPRETER_FUNCTION))
@@ -219,7 +302,7 @@ pub(crate) fn prepare(
 		},
 	};
 	request.replace_rest_field("tools", Value::Array(rewritten));
-	let client_tools = sanitize_client_tools(client_tools);
+	let client_tools = sanitize_client_tools(client_tools).map(Box::new);
 	let prepared_registry = Arc::new(registry.with_request_data(trusted_options, argument_schemas));
 	let deadline = super::RuntimeDeadline::new(prepared_registry.limits.total_timeout);
 	let programmatic_tools = programmatic_tools
@@ -239,10 +322,122 @@ pub(crate) fn prepare(
 		client_tools,
 		deadline,
 		pending_remote_mcp,
+		tool_search: tool_search_requested.then(|| Box::new(ToolSearchState::new(deferred_tools))),
 	};
 	prepared.refresh_programmatic_schema()?;
+	prepared.refresh_tool_search_schema()?;
 	*request = prepared.canonical_request.clone();
 	Ok(Activation::Active(prepared))
+}
+
+/// The `prepare` locals a function declaration contributes to. Bundled so both the `function` and
+/// `namespace` arms can share one acceptor without exceeding the argument-count lint.
+struct FunctionTarget<'a> {
+	seen_function_names: &'a mut HashSet<String>,
+	function_names: &'a mut Vec<String>,
+	managed_function_present: &'a mut bool,
+	argument_schemas: &'a mut HashMap<Strng, Arc<ArgumentSchema>>,
+	deferred_tools: &'a mut Vec<DeferredTool>,
+	rewritten: &'a mut Vec<Value>,
+}
+
+fn accept_function_declaration(
+	target: &mut FunctionTarget<'_>,
+	registry: Option<&Arc<ToolRegistry>>,
+	mut declaration: Value,
+	label: Option<&str>,
+	inherited_defer_loading: bool,
+) -> Result<(), ToolRuntimeError> {
+	if declaration.get("type").and_then(Value::as_str) != Some("function") {
+		return Err(ToolRuntimeError::invalid_request(
+			"namespace tools must be function declarations",
+		));
+	}
+	let name = declaration
+		.get("name")
+		.and_then(Value::as_str)
+		.ok_or_else(|| ToolRuntimeError::invalid_request("function tool requires a string name"))?;
+	if name.starts_with(RESERVED_PREFIX) {
+		return Err(ToolRuntimeError::invalid_request(format!(
+			"function tool name {name} uses the reserved _agentgateway_ namespace"
+		)));
+	}
+	if !target.seen_function_names.insert(name.to_owned()) {
+		return Err(ToolRuntimeError::invalid_request(format!(
+			"duplicate tool declaration for function {name}"
+		)));
+	}
+	let name = Strng::from(name);
+	if registry.is_some_and(|registry| registry.resolves_function(&name)) {
+		*target.managed_function_present = true;
+		let parameters = declaration.get("parameters").ok_or_else(|| {
+			ToolRuntimeError::invalid_request("managed function parameters must be a valid JSON Schema")
+		})?;
+		let schema = ArgumentSchema::compile(parameters).map_err(|()| {
+			ToolRuntimeError::invalid_request("managed function parameters must be a valid JSON Schema")
+		})?;
+		target.argument_schemas.insert(name.clone(), schema);
+	}
+	target.function_names.push(name.to_string());
+	let defer_loading = match declaration
+		.as_object_mut()
+		.and_then(|declaration| declaration.remove("defer_loading"))
+	{
+		None | Some(Value::Null) => inherited_defer_loading,
+		Some(Value::Bool(defer_loading)) => defer_loading || inherited_defer_loading,
+		Some(_) => {
+			return Err(ToolRuntimeError::invalid_request(
+				"defer_loading must be a boolean",
+			));
+		},
+	};
+	if !defer_loading {
+		target.rewritten.push(declaration);
+		return Ok(());
+	}
+	if target.deferred_tools.len() >= MAX_DEFERRED_TOOLS {
+		return Err(ToolRuntimeError::invalid_request(format!(
+			"deferred tool catalog exceeds the {MAX_DEFERRED_TOOLS}-tool limit"
+		)));
+	}
+	let description = super::truncate_utf8(
+		declaration
+			.get("description")
+			.and_then(Value::as_str)
+			.unwrap_or_default()
+			.to_owned(),
+		MAX_DESCRIPTION_BYTES,
+	);
+	target.deferred_tools.push(DeferredTool {
+		internal_name: name.clone(),
+		public_name: name,
+		label: label.map(str::to_owned),
+		description,
+		declaration,
+	});
+	Ok(())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NamespaceDeclaration {
+	#[serde(rename = "type")]
+	_tool_type: String,
+	name: String,
+	#[serde(default)]
+	description: Option<String>,
+	tools: Vec<Value>,
+	#[serde(default)]
+	defer_loading: Option<bool>,
+}
+
+/// The function name a `tool_choice: {"type":"function","name":...}` forces, if any.
+fn forced_function_name(request: &responses::Request) -> Option<&str> {
+	let tool_choice = request.rest_field("tool_choice")?;
+	if tool_choice.get("type").and_then(Value::as_str) != Some("function") {
+		return None;
+	}
+	tool_choice.get("name").and_then(Value::as_str)
 }
 
 fn sanitize_client_tools(client_tools: Option<Value>) -> Option<Value> {
@@ -319,13 +514,21 @@ fn remote_mcp_options(declaration: &Value) -> Result<RemoteMcpServer, ToolRuntim
 			));
 		}
 	}
+	let allowed_callers = parse_allowed_callers(declaration.allowed_callers)?;
+	let defer_loading = declaration.defer_loading.unwrap_or(false);
+	if defer_loading && allowed_callers.programmatic {
+		return Err(ToolRuntimeError::invalid_request(
+			"defer_loading cannot be combined with programmatic allowed_callers",
+		));
+	}
 	Ok(RemoteMcpServer {
 		server_label: declaration.server_label,
 		server_description: declaration.server_description,
 		server_url: declaration.server_url,
 		authorization: declaration.authorization.map(SecretString::from),
 		allowed_tools: declaration.allowed_tools,
-		allowed_callers: parse_allowed_callers(declaration.allowed_callers)?,
+		allowed_callers,
+		defer_loading,
 	})
 }
 
@@ -346,6 +549,8 @@ struct RemoteMcpDeclaration {
 	require_approval: Option<Value>,
 	#[serde(default)]
 	allowed_callers: Option<Vec<AllowedCaller>>,
+	#[serde(default)]
+	defer_loading: Option<bool>,
 }
 
 fn declarations(request: &responses::Request) -> Result<Vec<Value>, ToolRuntimeError> {

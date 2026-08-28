@@ -27,6 +27,7 @@ CASE_NAMES = (
     "programmatic-mcp-weather",
     "streaming-tool-runtime",
     "remote-mcp-weather",
+    "tool-search-weather-mcp",
 )
 DEFAULT_MODEL = "qwen3.6-flash"
 DEFAULT_UPSTREAM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -255,6 +256,15 @@ def case_payloads(
         "allowed_callers": ["programmatic"],
         "require_approval": "never",
     }
+    deferred_weather_mcp_tool = {
+        "type": "mcp",
+        "server_label": "weather",
+        "server_url": weather_mcp_url,
+        "authorization": weather_mcp_token,
+        "allowed_tools": ["get_forecast", "get_current_weather"],
+        "require_approval": "never",
+        "defer_loading": True,
+    }
     return {
         "web-search": {
             "model": model,
@@ -348,6 +358,20 @@ def case_payloads(
             "enable_thinking": False,
             "stream": False,
         },
+        "tool-search-weather-mcp": {
+            "model": model,
+            "input": (
+                "No weather tool is loaded yet. Use the tool search function to find a "
+                "weather tool, then call the tool it returns to get the current weather "
+                "for Shanghai, China. Summarize the observed weather data and include the "
+                "exact marker TOOL_SEARCH_WEATHER_MCP_OK in the final answer."
+            ),
+            # No tool_choice: forcing a tool on a deferred server injects its declaration
+            # eagerly, which is the one path that would let this case pass without a search.
+            "tools": [{"type": "tool_search"}, deferred_weather_mcp_tool],
+            "enable_thinking": False,
+            "stream": False,
+        },
     }
 
 
@@ -370,54 +394,50 @@ def extract_output_text(response: Mapping[str, Any]) -> str:
     return "\n".join(texts)
 
 
-def extract_programmatic_tool_codes(logs: str) -> List[str]:
-    codes: List[str] = []
+PROGRAM_SOURCE_MESSAGE = "programmatic tool call program source"
+
+
+def extract_program_sources(logs: str) -> List[str]:
+    sources: List[str] = []
     for line in logs.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict) or event.get("message") != (
-            "generated programmatic tool call code"
-        ):
+        if not isinstance(event, dict) or event.get("message") != PROGRAM_SOURCE_MESSAGE:
             continue
-        code = event.get("programmatic_code")
+        code = event.get("code")
         if isinstance(code, str) and code:
-            codes.append(code)
-    return codes
+            sources.append(code)
+    return sources
 
 
-def print_case_output(case_name: str, text: str, program_codes: Sequence[str]) -> None:
+def read_program_sources(log_path: Path, offset: int) -> Tuple[List[str], int]:
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(offset)
+            data = handle.read()
+    except OSError as error:
+        raise HarnessFailure("could not read the AgentGateway log") from error
+    # The child is still appending, so stop at the last newline and leave the rest for next time.
+    end = data.rfind(b"\n")
+    if end < 0:
+        return [], offset
+    logs = data[: end + 1].decode("utf-8", "replace")
+    return extract_program_sources(logs), offset + end + 1
+
+
+def print_case_output(case_name: str, text: str, program_sources: Sequence[str]) -> None:
     if case_name == "programmatic-mcp-weather":
         require(
-            bool(program_codes),
-            "programmatic weather case did not capture generated program code",
+            bool(program_sources),
+            "programmatic weather case did not capture generated program source",
         )
-        for index, code in enumerate(program_codes, start=1):
-            print("PROGRAMMATIC TOOL CALL CODE {} (Python)".format(index))
-            print(code)
-            print("END PROGRAMMATIC TOOL CALL CODE {}".format(index))
+    for index, code in enumerate(program_sources, start=1):
+        print("PROGRAM SOURCE {} (Python)".format(index))
+        print(code)
+        print("END PROGRAM SOURCE {}".format(index))
     print(text)
-
-
-def live_case_groups(
-    selected_cases: Sequence[str], show_output: bool
-) -> List[Tuple[str, ...]]:
-    if not show_output or "programmatic-mcp-weather" not in selected_cases:
-        return [tuple(selected_cases)]
-    groups: List[Tuple[str, ...]] = []
-    pending: List[str] = []
-    for case_name in selected_cases:
-        if case_name == "programmatic-mcp-weather":
-            if pending:
-                groups.append(tuple(pending))
-                pending = []
-            groups.append((case_name,))
-        else:
-            pending.append(case_name)
-    if pending:
-        groups.append(tuple(pending))
-    return groups
 
 
 def tool_success_counts(metrics: str) -> Dict[Tuple[str, str], int]:
@@ -607,9 +627,11 @@ def expected_tool_backends(case_name: str) -> Tuple[Tuple[str, str], ...]:
         return (("web_search", "http"),)
     if case_name == "code-interpreter":
         return (("code_interpreter", "e2b"),)
-    if case_name == "remote-mcp-weather":
-        return (("remote_mcp", "remote_mcp"),)
-    if case_name == "programmatic-mcp-weather":
+    if case_name in (
+        "remote-mcp-weather",
+        "programmatic-mcp-weather",
+        "tool-search-weather-mcp",
+    ):
         return (("remote_mcp", "remote_mcp"),)
     if case_name in ("combined", "programmatic-server-tools"):
         return (
@@ -628,6 +650,7 @@ def expected_marker(case_name: str) -> str:
         "programmatic-mcp-weather": "PROGRAMMATIC_MCP_WEATHER_3DAY_OK",
         "streaming-tool-runtime": "STREAMING_TOOL_RUNTIME_OK",
         "remote-mcp-weather": "WEATHER_MCP_BEIJING_OK",
+        "tool-search-weather-mcp": "TOOL_SEARCH_WEATHER_MCP_OK",
     }[case_name]
 
 
@@ -643,6 +666,26 @@ def final_streaming_response(events: Sequence[Mapping[str, Any]]) -> Mapping[str
     response = completed[0].get("response")
     require(isinstance(response, dict), "response.completed omitted its response object")
     return response
+
+
+def require_deferred_tool_contract(
+    response: Mapping[str, Any], payload: Mapping[str, Any]
+) -> None:
+    expected = []
+    for declaration in payload["tools"]:
+        declaration = dict(declaration)
+        # The gateway strips the MCP credential before echoing; everything else round-trips.
+        declaration.pop("authorization", None)
+        expected.append(declaration)
+    require(
+        response.get("tools") == expected,
+        "the deferred tool declarations did not round-trip to the client",
+    )
+    serialized = json.dumps(response, separators=(",", ":"), sort_keys=True)
+    require(
+        "_agentgateway" not in serialized,
+        "a reserved internal name reached the client",
+    )
 
 
 def run_case(
@@ -676,6 +719,15 @@ def run_case(
             and ("lowest" in lowered or "coldest" in lowered or "最低" in text),
             "programmatic weather output omitted the highest or lowest temperature day",
         )
+    if case_name == "tool-search-weather-mcp":
+        require_deferred_tool_contract(response, payload)
+        # The declaration was withheld from round one, so a successful remote_mcp call below is
+        # only reachable through a search that injected it. Requiring a measured value keeps the
+        # model from passing on the marker alone.
+        require(
+            bool(re.search(r"-?\d+(?:\.\d+)?\s*(?:°|degrees?\b|C\b|F\b)", text)),
+            "tool search weather output omitted an observed temperature",
+        )
     after = tool_success_counts(fetch_metrics(stats_port))
     for tool, backend in expected_tool_backends(case_name):
         metric_key = (tool, backend)
@@ -694,14 +746,10 @@ def run_gateway_attempt(
     selected_cases: Sequence[str],
     show_output: bool,
 ) -> None:
-    visible_weather_code = show_output and tuple(selected_cases) == (
-        "programmatic-mcp-weather",
-    )
     ports, reservations = reserve_loopback_ports(3)
     gateway_port, readiness_port, stats_port = ports
     client_token = secrets.token_urlsafe(32)
     process: Optional[subprocess.Popen[Any]] = None
-    weather_text: Optional[str] = None
     try:
         with tempfile.TemporaryDirectory(prefix="agentgateway-live-functional-") as temp_dir:
             temp_path = Path(temp_dir)
@@ -718,10 +766,10 @@ def run_gateway_attempt(
                 environment[
                     "AGENTGATEWAY_LIVE_UPSTREAM_BASE_URL"
                 ] = configuration.upstream_base_url
-                if visible_weather_code:
+                if show_output:
                     environment["LOG_FORMAT"] = "json"
                     environment["RUST_LOG"] = (
-                        "agentgateway::llm::tool_runtime::runner=debug"
+                        "info,agentgateway::llm::tool_runtime::runner=trace"
                     )
                 process = subprocess.Popen(
                     [str(binary), "--file", str(config_path)],
@@ -745,6 +793,7 @@ def run_gateway_attempt(
                         configuration.weather_mcp_url,
                         configuration.weather_mcp_token,
                     )
+                    log_offset = 0
                     for case_name in selected_cases:
                         text = run_case(
                             base_url,
@@ -753,29 +802,14 @@ def run_gateway_attempt(
                             case_name,
                             payloads[case_name],
                         )
-                        if visible_weather_code:
-                            weather_text = text
-                        else:
-                            if show_output:
-                                print_case_output(case_name, text, ())
-                            print("PASS {}".format(case_name))
+                        if show_output:
+                            sources, log_offset = read_program_sources(log_path, log_offset)
+                            print_case_output(case_name, text, sources)
+                        print("PASS {}".format(case_name))
                     require(process.poll() is None, "AgentGateway exited during live cases")
                 finally:
                     stop_process(process)
                     process = None
-            if weather_text is not None:
-                try:
-                    logs = log_path.read_text(encoding="utf-8")
-                except OSError as error:
-                    raise HarnessFailure(
-                        "could not read programmatic weather debug log"
-                    ) from error
-                print_case_output(
-                    "programmatic-mcp-weather",
-                    weather_text,
-                    extract_programmatic_tool_codes(logs),
-                )
-                print("PASS programmatic-mcp-weather")
     finally:
         close_reservations(reservations)
         if process is not None:
@@ -792,12 +826,9 @@ def run(
     require(binary.is_file(), "release binary path is not a file")
     require(os.access(str(binary), os.X_OK), "release binary path is not executable")
     configuration = LiveConfiguration.load(dotenv.expanduser().resolve(), os.environ)
-    for case_group in live_case_groups(selected_cases, show_output):
-        run_with_startup_retries(
-            lambda case_group=case_group: run_gateway_attempt(
-                binary, configuration, case_group, show_output
-            )
-        )
+    run_with_startup_retries(
+        lambda: run_gateway_attempt(binary, configuration, selected_cases, show_output)
+    )
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:

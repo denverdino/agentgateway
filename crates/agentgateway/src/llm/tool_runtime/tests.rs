@@ -929,6 +929,7 @@ async fn remote_mcp_discovery_obeys_total_runtime_deadline() {
 		authorization: None,
 		allowed_tools: None,
 		allowed_callers: super::AllowedCallers::default(),
+		defer_loading: false,
 	};
 	let started = Instant::now();
 	let result = RemoteMcpBackend::connect_for_test(
@@ -1046,6 +1047,7 @@ async fn remote_mcp_discovers_filters_and_executes_over_one_session() {
 		authorization: Some(SecretString::from("mcp-oauth-token")),
 		allowed_tools: Some(vec!["roll".into()]),
 		allowed_callers: super::AllowedCallers::default(),
+		defer_loading: false,
 	};
 	let (backend, tools) = RemoteMcpBackend::connect_for_test(
 		policy_client(),
@@ -3453,8 +3455,9 @@ async fn runner_fits_nested_output_into_replay_after_tool_execution() {
 	assert_eq!(output["error"]["type"], "program_replay_limit");
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn runner_debug_logs_do_not_include_generated_program_source() {
+const PRIVATE_PROGRAM: &str = "program_output('customer-private-value')";
+
+async fn capture_program_run_logs(max_level: tracing::Level) -> String {
 	#[derive(Clone)]
 	struct LogWriter(Arc<Mutex<Vec<u8>>>);
 
@@ -3469,7 +3472,6 @@ async fn runner_debug_logs_do_not_include_generated_program_source() {
 		}
 	}
 
-	const PRIVATE_PROGRAM: &str = "program_output('customer-private-value')";
 	let mut client_request = request(json!({
 		"input":"run",
 		"tools":[
@@ -3516,7 +3518,7 @@ async fn runner_debug_logs_do_not_include_generated_program_source() {
 	let subscriber = tracing_subscriber::fmt()
 		.with_ansi(false)
 		.without_time()
-		.with_max_level(tracing::Level::DEBUG)
+		.with_max_level(max_level)
 		.with_writer(move || writer.clone())
 		.finish();
 	let _guard = tracing::subscriber::set_default(subscriber);
@@ -3525,7 +3527,13 @@ async fn runner_debug_logs_do_not_include_generated_program_source() {
 		.await
 		.expect("program completes");
 
-	let logs = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+	String::from_utf8(logs.lock().unwrap().clone()).unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runner_debug_logs_do_not_include_generated_program_source() {
+	let logs = capture_program_run_logs(tracing::Level::DEBUG).await;
+
 	assert!(
 		logs.contains("generated programmatic tool call code"),
 		"{logs}"
@@ -3533,6 +3541,20 @@ async fn runner_debug_logs_do_not_include_generated_program_source() {
 	assert!(
 		!logs.contains(PRIVATE_PROGRAM),
 		"debug logs leaked program source: {logs}"
+	);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn runner_trace_logs_include_generated_program_source() {
+	let logs = capture_program_run_logs(tracing::Level::TRACE).await;
+
+	assert!(
+		logs.contains("programmatic tool call program source"),
+		"{logs}"
+	);
+	assert!(
+		logs.contains(PRIVATE_PROGRAM),
+		"trace logs omitted program source: {logs}"
 	);
 }
 
@@ -5139,4 +5161,663 @@ async fn sandbox_grouping_obeys_parallel_flag_and_keeps_outputs_in_original_orde
 			"the Sandbox batch counts as one operation under the shared limit"
 		);
 	}
+}
+
+fn deferred_mcp_request() -> responses::Request {
+	request(json!({
+		"input": "roll dice",
+		"tools": [
+			{ "type": "tool_search" },
+			{
+				"type": "mcp",
+				"server_label": "dice",
+				"server_description": "Dice utilities",
+				"server_url": "https://mcp.example.com/mcp",
+				"require_approval": "never",
+				"defer_loading": true
+			}
+		]
+	}))
+}
+
+fn remote_tool(name: &str, description: &str) -> super::RemoteMcpTool {
+	super::RemoteMcpTool {
+		remote_name: name.into(),
+		description: Some(description.to_owned()),
+		input_schema: json!({
+			"type": "object",
+			"properties": {"sides": {"type": "integer"}},
+			"required": ["sides"],
+			"additionalProperties": false
+		}),
+		output_schema: None,
+	}
+}
+
+#[test]
+fn deferred_mcp_tools_are_withheld_until_tool_search() {
+	let mut client_request = deferred_mcp_request();
+	let Activation::Active(mut prepared) = prepare(
+		&mut client_request,
+		Some(&registry(vec![tool("managed", None)])),
+	)
+	.unwrap() else {
+		panic!("tool_search must activate the runtime");
+	};
+	prepared
+		.install_remote_mcp_tools_for_test(
+			0,
+			Arc::new(BatchBackend),
+			vec![
+				remote_tool("roll", "Roll one die"),
+				remote_tool("shuffle", "Shuffle a deck"),
+			],
+		)
+		.unwrap();
+
+	let declared = tools(&prepared.canonical_request);
+	assert_eq!(
+		declared.len(),
+		1,
+		"a deferred server contributes no function declarations: {declared:?}"
+	);
+	assert_eq!(declared[0]["name"], super::TOOL_SEARCH_FUNCTION);
+	let description = declared[0]["description"].as_str().unwrap();
+	assert!(
+		description.contains("dice (dice.roll, dice.shuffle)"),
+		"the index names the searchable group: {description}"
+	);
+	assert!(
+		!description.contains("_agentgateway_mcp_0_0"),
+		"internal names never reach the model: {description}"
+	);
+
+	let result = prepared.execute_tool_search("roll").unwrap();
+	let super::ToolExecutionResult::Function(reported) = result else {
+		panic!("tool search returns a function result");
+	};
+	let reported = reported["tools"].as_array().unwrap();
+	assert_eq!(
+		reported.len(),
+		1,
+		"an unmatched tool stays deferred: {reported:?}"
+	);
+	assert_eq!(reported[0]["name"], "dice.roll");
+	assert!(
+		reported[0]["parameters"].is_object(),
+		"the model needs the argument schema to call the tool"
+	);
+
+	let declared = tools(&prepared.canonical_request);
+	assert_eq!(declared[0]["name"], super::TOOL_SEARCH_FUNCTION);
+	assert_eq!(
+		declared.last().unwrap()["name"],
+		"_agentgateway_mcp_0_0",
+		"injected declarations are appended so the cached prefix survives"
+	);
+}
+
+#[test]
+fn tool_search_injects_each_declaration_at_most_once() {
+	let mut client_request = deferred_mcp_request();
+	let Activation::Active(mut prepared) = prepare(
+		&mut client_request,
+		Some(&registry(vec![tool("managed", None)])),
+	)
+	.unwrap() else {
+		panic!("tool_search must activate the runtime");
+	};
+	prepared
+		.install_remote_mcp_tools_for_test(
+			0,
+			Arc::new(BatchBackend),
+			vec![remote_tool("roll", "Roll one die")],
+		)
+		.unwrap();
+
+	prepared.execute_tool_search("roll").unwrap();
+	let after_first = tools(&prepared.canonical_request).len();
+	let result = prepared.execute_tool_search("roll").unwrap();
+	let super::ToolExecutionResult::Function(reported) = result else {
+		panic!("tool search returns a function result");
+	};
+	assert_eq!(
+		reported["tools"].as_array().unwrap().len(),
+		1,
+		"a repeated search still reports the definition"
+	);
+	assert_eq!(
+		tools(&prepared.canonical_request).len(),
+		after_first,
+		"a duplicate tool name in tools would be an upstream 400"
+	);
+}
+
+#[test]
+fn namespace_functions_are_deferred_and_flattened() {
+	let mut client_request = request(json!({
+		"input": "test",
+		"tools": [
+			{ "type": "tool_search" },
+			{
+				"type": "namespace",
+				"name": "weather",
+				"description": "Weather utilities",
+				"defer_loading": true,
+				"tools": [{
+					"type": "function",
+					"name": "managed",
+					"description": "Look up a forecast",
+					"parameters": {"type": "object", "additionalProperties": false}
+				}]
+			}
+		]
+	}));
+	let Activation::Active(mut prepared) = prepare(
+		&mut client_request,
+		Some(&registry(vec![tool("managed", None)])),
+	)
+	.unwrap() else {
+		panic!("a deferred namespace must activate the runtime");
+	};
+
+	let declared = tools(&prepared.canonical_request);
+	assert_eq!(declared.len(), 1);
+	assert_eq!(declared[0]["name"], super::TOOL_SEARCH_FUNCTION);
+	assert!(
+		declared[0]["description"]
+			.as_str()
+			.unwrap()
+			.contains("weather (managed)"),
+		"the namespace name is searchable text, not a forwarded declaration"
+	);
+
+	prepared.execute_tool_search("forecast").unwrap();
+	let injected = tools(&prepared.canonical_request).last().unwrap().clone();
+	assert_eq!(injected["type"], "function");
+	assert_eq!(
+		injected["name"], "managed",
+		"a flattened namespace function keeps its original name"
+	);
+	assert_eq!(
+		injected["description"], "[weather] Weather utilities\n\nLook up a forecast",
+		"the namespace context is composed onto its members"
+	);
+	assert!(
+		injected.get("defer_loading").is_none(),
+		"the injected declaration is an ordinary function"
+	);
+
+	let calls = prepared
+		.collect_calls(&response_with_calls(vec![function_call(
+			"managed", "call_1", "{}",
+		)]))
+		.unwrap();
+	assert_eq!(calls[0].public_name, "managed");
+}
+
+#[test]
+fn rejects_unreachable_deferred_and_forced_deferred_tools() {
+	for (label, tool_declarations, expected) in [
+		(
+			"duplicate_tool_search",
+			json!([{ "type": "tool_search" }, { "type": "tool_search" }]),
+			"duplicate",
+		),
+		(
+			"defer_without_search",
+			json!([{
+				"type": "function",
+				"name": "managed",
+				"parameters": {"type": "object"},
+				"defer_loading": true
+			}]),
+			"defer_loading requires a tool_search declaration",
+		),
+		(
+			"search_without_deferred",
+			json!([
+				{ "type": "tool_search" },
+				{ "type": "function", "name": "managed", "parameters": {"type": "object"} }
+			]),
+			"tool_search requires at least one tool with defer_loading",
+		),
+		(
+			"deferred_programmatic_only",
+			json!([
+				{ "type": "tool_search" },
+				{
+					"type": "mcp",
+					"server_label": "dice",
+					"server_url": "https://mcp.example.com/mcp",
+					"require_approval": "never",
+					"defer_loading": true,
+					"allowed_callers": ["programmatic"]
+				}
+			]),
+			"defer_loading",
+		),
+		(
+			"deferred_unsupported_type",
+			json!([
+				{ "type": "tool_search" },
+				{ "type": "custom", "name": "passthrough", "defer_loading": true }
+			]),
+			"defer_loading is only supported on",
+		),
+		(
+			"deferred_unsupported_type_without_search",
+			json!([
+				{ "type": "function", "name": "managed", "parameters": {"type": "object"} },
+				{ "type": "custom", "name": "passthrough", "defer_loading": true }
+			]),
+			"defer_loading is only supported on",
+		),
+	] {
+		let mut client_request = request(json!({ "input": "test", "tools": tool_declarations }));
+		let error = prepare(
+			&mut client_request,
+			Some(&registry(vec![tool("managed", None)])),
+		)
+		.expect_err(label);
+		assert!(error.to_string().contains(expected), "{label}: {error}");
+	}
+}
+
+#[test]
+fn rejects_tool_choice_that_forces_a_deferred_function() {
+	let mut client_request = request(json!({
+		"input": "test",
+		"tool_choice": {"type": "function", "name": "managed"},
+		"tools": [
+			{ "type": "tool_search" },
+			{
+				"type": "function",
+				"name": "managed",
+				"parameters": {"type": "object"},
+				"defer_loading": true
+			}
+		]
+	}));
+	let error = prepare(
+		&mut client_request,
+		Some(&registry(vec![tool("managed", None)])),
+	)
+	.expect_err("round one would omit the forced tool from tools");
+	assert!(
+		error
+			.to_string()
+			.contains("cannot force the deferred function"),
+		"{error}"
+	);
+}
+
+#[test]
+fn deferred_catalog_and_search_index_are_bounded() {
+	let mut client_request = deferred_mcp_request();
+	let Activation::Active(mut prepared) = prepare(
+		&mut client_request,
+		Some(&registry(vec![tool("managed", None)])),
+	)
+	.unwrap() else {
+		panic!("tool_search must activate the runtime");
+	};
+	let error = prepared
+		.install_remote_mcp_tools_for_test(
+			0,
+			Arc::new(BatchBackend),
+			// Deliberately more tools from one server than discovery would return: the catalog limit spans
+			// servers, so reaching it in production takes several of them.
+			(0..super::MAX_DEFERRED_TOOLS + 1)
+				.map(|index| remote_tool(&format!("tool_{index}"), "bounded"))
+				.collect(),
+		)
+		.expect_err("the deferred catalog is bounded");
+	assert!(
+		error.to_string().contains("deferred tool catalog exceeds"),
+		"{error}"
+	);
+
+	let mut client_request = deferred_mcp_request();
+	let Activation::Active(mut prepared) = prepare(
+		&mut client_request,
+		Some(&registry(vec![tool("managed", None)])),
+	)
+	.unwrap() else {
+		panic!("tool_search must activate the runtime");
+	};
+	prepared
+		.install_remote_mcp_tools_for_test(
+			0,
+			Arc::new(BatchBackend),
+			(0..super::MAX_DEFERRED_TOOLS)
+				.map(|index| remote_tool(&format!("{}_{index}", "n".repeat(120)), "bounded"))
+				.collect(),
+		)
+		.unwrap();
+	let description = tools(&prepared.canonical_request)[0]["description"]
+		.as_str()
+		.unwrap();
+	assert!(
+		description.len() <= super::MAX_TOOL_SEARCH_INDEX_BYTES + 256,
+		"the index lives in the cached prefix: bytes={}",
+		description.len()
+	);
+	// An over-budget group must be truncated, not dropped: an empty listing tells the model nothing is
+	// searchable and silently disables the feature for exactly the large catalogs it exists to serve.
+	let index = description
+		.split_once("Groups available to search: ")
+		.unwrap()
+		.1;
+	assert!(
+		index.contains("dice ("),
+		"the over-budget group keeps its label: {index:?}"
+	);
+	assert!(
+		index.contains(&"n".repeat(120)),
+		"the over-budget group still names tools: bytes={}",
+		index.len()
+	);
+	assert!(
+		index.contains("more"),
+		"a truncated listing says so: {:?}",
+		&index[index.len().saturating_sub(120)..]
+	);
+}
+
+#[test]
+fn tool_search_calls_are_bounded_and_counted_against_the_budget() {
+	let mut client_request = deferred_mcp_request();
+	let Activation::Active(mut prepared) = prepare(
+		&mut client_request,
+		Some(&registry(vec![tool("managed", None)])),
+	)
+	.unwrap() else {
+		panic!("tool_search must activate the runtime");
+	};
+	prepared
+		.install_remote_mcp_tools_for_test(
+			0,
+			Arc::new(BatchBackend),
+			vec![remote_tool("roll", "Roll one die")],
+		)
+		.unwrap();
+
+	for call in 1..=super::MAX_TOOL_SEARCH_CALLS {
+		assert!(
+			matches!(
+				prepared.execute_tool_search("roll").unwrap(),
+				super::ToolExecutionResult::Function(_)
+			),
+			"call {call} is within the limit"
+		);
+	}
+	let super::ToolExecutionResult::ApplicationError(error) =
+		prepared.execute_tool_search("roll").unwrap()
+	else {
+		panic!("exceeding the limit stays model visible so the model can still finish");
+	};
+	assert_eq!(error.r#type, "tool_search_limit");
+
+	let mut budget = RuntimeBudget::new(&prepared.registry, policy_client()).unwrap();
+	budget.reserve_calls(2).unwrap();
+	assert_eq!(
+		budget.tool_calls(),
+		2,
+		"gateway-served searches still consume the tool call budget"
+	);
+}
+
+#[tokio::test]
+async fn runner_loads_a_deferred_tool_through_tool_search_and_hides_the_search() {
+	let mut client_request = request(json!({
+		"input": "roll a die",
+		"tools": [
+			{ "type": "tool_search" },
+			{
+				"type": "function",
+				"name": "managed",
+				"description": "Roll one die",
+				"parameters": {"type": "object", "additionalProperties": false},
+				"defer_loading": true
+			}
+		]
+	}));
+	let Activation::Active(runtime) = prepare(
+		&mut client_request,
+		Some(&registry(vec![tool("managed", None)])),
+	)
+	.unwrap() else {
+		panic!("tool_search must activate the runtime");
+	};
+	let budget = RuntimeBudget::with_test_backends(
+		&runtime.registry,
+		HashMap::from([(
+			"managed".to_owned(),
+			Arc::new(BatchBackend) as Arc<dyn ToolBackend>,
+		)]),
+	);
+	let mut round_trip = FakeResponsesRoundTrip {
+		rounds: VecDeque::from([
+			successful_model_round(vec![function_call(
+				super::TOOL_SEARCH_FUNCTION,
+				"call_search_1",
+				r#"{"query":"roll a die"}"#,
+			)]),
+			successful_model_round(vec![function_call("managed", "call_managed_1", "{}")]),
+			successful_model_round(vec![json!({
+				"type": "message",
+				"id": "msg_final",
+				"role": "assistant",
+				"status": "completed",
+				"content": []
+			})]),
+		]),
+		requests: Vec::new(),
+	};
+
+	let result = super::runner::run(runtime, budget, &mut round_trip)
+		.await
+		.expect("the tool search loop completes");
+
+	let first_round_tools = round_trip.requests[0]["tools"].as_array().unwrap();
+	assert_eq!(first_round_tools.len(), 1);
+	assert_eq!(first_round_tools[0]["name"], super::TOOL_SEARCH_FUNCTION);
+	let second_round_tools = round_trip.requests[1]["tools"].as_array().unwrap();
+	assert!(
+		second_round_tools
+			.iter()
+			.any(|declaration| declaration["name"] == "managed"),
+		"the searched tool must be callable in the next round: {second_round_tools:?}"
+	);
+	let search_output = round_trip.requests[1]["input"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_search_1")
+		.expect("the search result is replayed to the model");
+	assert!(
+		search_output["output"]
+			.as_str()
+			.unwrap()
+			.contains("managed"),
+		"{search_output:?}"
+	);
+
+	assert!(matches!(
+		result.response.output.as_slice(),
+		[responses::typed::OutputItem::Message(_)]
+	));
+	let final_response =
+		super::serialize_managed_response(&result.response, &result.raw_output).unwrap();
+	let final_response = String::from_utf8(final_response).unwrap();
+	assert!(
+		!final_response.contains(super::TOOL_SEARCH_FUNCTION),
+		"search internals stay hidden from the client"
+	);
+	assert_eq!(
+		result.summary.client_tools.as_ref().unwrap(),
+		&json!([
+			{ "type": "tool_search" },
+			{
+				"type": "function",
+				"name": "managed",
+				"description": "Roll one die",
+				"parameters": {"type": "object", "additionalProperties": false},
+				"defer_loading": true
+			}
+		]),
+		"the client sees back exactly the tools it sent"
+	);
+}
+
+fn forced_deferred_mcp_request(forced: &str) -> responses::Request {
+	request(json!({
+		"input": "roll dice",
+		"tool_choice": {"type": "mcp", "server_label": "dice", "name": forced},
+		"tools": [
+			{ "type": "tool_search" },
+			{
+				"type": "mcp",
+				"server_label": "dice",
+				"server_description": "Dice utilities",
+				"server_url": "https://mcp.example.com/mcp",
+				"require_approval": "never",
+				"defer_loading": true
+			}
+		]
+	}))
+}
+
+fn declared_names(request: &responses::Request) -> Vec<&str> {
+	tools(request)
+		.iter()
+		.map(|declaration| declaration["name"].as_str().unwrap())
+		.collect()
+}
+
+#[test]
+fn a_forced_tool_on_a_deferred_server_is_declared_in_the_first_round() {
+	let mut client_request = forced_deferred_mcp_request("roll");
+	let Activation::Active(mut prepared) = prepare(
+		&mut client_request,
+		Some(&registry(vec![tool("managed", None)])),
+	)
+	.unwrap() else {
+		panic!("tool_search must activate the runtime");
+	};
+	prepared
+		.install_remote_mcp_tools_for_test(
+			0,
+			Arc::new(BatchBackend),
+			vec![
+				remote_tool("roll", "Roll one die"),
+				remote_tool("shuffle", "Shuffle a deck"),
+			],
+		)
+		.unwrap();
+
+	let names = declared_names(&prepared.canonical_request);
+	assert_eq!(
+		names.len(),
+		2,
+		"only the forced tool escapes deferral: {names:?}"
+	);
+	assert!(
+		names.contains(&"_agentgateway_mcp_0_0"),
+		"a forced tool cannot be deferred past the round that requires it: {names:?}"
+	);
+	assert!(names.contains(&super::TOOL_SEARCH_FUNCTION));
+	assert_eq!(
+		prepared.canonical_request.rest.get("tool_choice").unwrap(),
+		&json!({"type": "function", "name": "_agentgateway_mcp_0_0"}),
+		"the forced MCP choice is translated to the internal function"
+	);
+
+	let description = tools(&prepared.canonical_request)
+		.iter()
+		.find(|declaration| declaration["name"] == super::TOOL_SEARCH_FUNCTION)
+		.unwrap()["description"]
+		.as_str()
+		.unwrap();
+	assert!(
+		description.contains("dice (dice.shuffle)"),
+		"the eagerly declared tool leaves the search index: {description}"
+	);
+}
+
+#[test]
+fn injected_tool_declarations_are_bounded_and_never_silently_dropped() {
+	const GROUPS: [&str; super::MAX_TOOL_SEARCH_CALLS] = [
+		"alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+	];
+	// A full group per permitted search, each sized to the per-search result cap, so the searches
+	// together attempt exactly one injection more than the cap allows.
+	let mut discovered = Vec::new();
+	for group in GROUPS {
+		for index in 0..super::MAX_TOOL_SEARCH_RESULTS {
+			discovered.push(remote_tool(&format!("{group}_{index}"), "a tool"));
+		}
+	}
+	assert_eq!(
+		discovered.len(),
+		1 + super::MAX_INJECTED_TOOLS,
+		"the searches must be able to overrun the injection cap by exactly one"
+	);
+
+	let mut client_request = deferred_mcp_request();
+	let Activation::Active(mut prepared) = prepare(
+		&mut client_request,
+		Some(&registry(vec![tool("managed", None)])),
+	)
+	.unwrap() else {
+		panic!("tool_search must activate the runtime");
+	};
+	prepared
+		.install_remote_mcp_tools_for_test(0, Arc::new(BatchBackend), discovered)
+		.unwrap();
+	// Nothing but the search declaration: every discovered tool is deferred.
+	assert_eq!(tools(&prepared.canonical_request).len(), 1);
+
+	let mut injected = 0;
+	for group in &GROUPS[..GROUPS.len() - 1] {
+		let super::ToolExecutionResult::Function(reported) =
+			prepared.execute_tool_search(group).unwrap()
+		else {
+			panic!("search {group} must stay under the injection cap");
+		};
+		assert_eq!(
+			reported["tools"].as_array().unwrap().len(),
+			super::MAX_TOOL_SEARCH_RESULTS,
+			"a query matches exactly its own group"
+		);
+		injected += super::MAX_TOOL_SEARCH_RESULTS;
+		assert_eq!(tools(&prepared.canonical_request).len(), 1 + injected);
+	}
+
+	let last = GROUPS[GROUPS.len() - 1];
+	let super::ToolExecutionResult::Function(reported) = prepared.execute_tool_search(last).unwrap()
+	else {
+		panic!("the capped search still injected declarations, so it is a partial success");
+	};
+	assert_eq!(reported["truncated"], serde_json::json!(true));
+	// One short of a full group: the cap is reached mid-group, and the tool that tripped it must not be
+	// reported, because `collect_model_calls` would reject the call that report invites.
+	assert_eq!(
+		reported["tools"].as_array().unwrap().len(),
+		super::MAX_TOOL_SEARCH_RESULTS - 1
+	);
+	// Whatever fitted before the cap must still be declared: recording a tool as injected without
+	// declaring it would strand it, because the dedup check then skips it forever.
+	assert_eq!(
+		tools(&prepared.canonical_request).len(),
+		1 + super::MAX_INJECTED_TOOLS,
+		"partial injections survive the capped search"
+	);
+	let names = declared_names(&prepared.canonical_request);
+	assert_eq!(
+		names.iter().collect::<std::collections::HashSet<_>>().len(),
+		names.len(),
+		"a duplicate declaration would be an upstream 400: {names:?}"
+	);
 }

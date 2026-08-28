@@ -737,3 +737,120 @@ async fn responses_unmanaged_function_keeps_one_call_passthrough_path() {
 	assert_eq!(model.received_requests().await.unwrap().len(), 1);
 	assert_eq!(tool.received_requests().await.unwrap().len(), 0);
 }
+
+#[tokio::test]
+async fn responses_deferred_tool_is_loaded_by_gateway_executed_tool_search() {
+	let model = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(ResponseSequence {
+			responses: Arc::new(vec![
+				responses_body(
+					json!([function_call(
+						"_agentgateway_tool_search",
+						"call_search_1",
+						"{\"query\":\"managed weather\"}",
+					)]),
+					10,
+					3,
+				),
+				responses_body(
+					json!([function_call(
+						"managed",
+						"call_1",
+						"{\"city\":\"Hangzhou\"}"
+					)]),
+					12,
+					3,
+				),
+				responses_body(json!([final_message("It is 22 C.")]), 14, 4),
+			]),
+			next: Arc::new(AtomicUsize::new(0)),
+		})
+		.mount(&model)
+		.await;
+	let tool = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({"temperature_c": 22})))
+		.mount(&tool)
+		.await;
+	let (_bind, io) = managed_tool_proxy(&model, &tool, runtime_limits()).await;
+
+	let response = proxymock::send_request_body(
+		io,
+		Method::POST,
+		"http://lo/v1/responses",
+		br#"{
+			"model":"gpt-test",
+			"input":"weather",
+			"tools":[
+				{"type":"tool_search"},
+				{
+					"type":"function",
+					"name":"managed",
+					"description":"Look up the weather forecast for a city",
+					"parameters":{"type":"object"},
+					"defer_loading":true
+				}
+			]
+		}"#,
+	)
+	.await;
+
+	assert_eq!(response.status(), 200);
+	let body = response_json(response).await;
+	assert_eq!(body["output"].as_array().unwrap().len(), 1);
+	assert_eq!(body["output"][0]["content"][0]["text"], "It is 22 C.");
+	assert_eq!(
+		body["tools"],
+		json!([
+			{"type":"tool_search"},
+			{
+				"type":"function",
+				"name":"managed",
+				"description":"Look up the weather forecast for a city",
+				"parameters":{"type":"object"},
+				"defer_loading":true
+			}
+		]),
+		"the client's declarations round-trip verbatim: {:?}",
+		body["tools"]
+	);
+
+	let model_requests = model.received_requests().await.unwrap();
+	assert_eq!(model_requests.len(), 3);
+
+	let first: serde_json::Value = serde_json::from_slice(&model_requests[0].body).unwrap();
+	let first_tools = first["tools"].as_array().unwrap();
+	assert_eq!(
+		first_tools.len(),
+		1,
+		"the deferred tool must be withheld from the cached prefix: {first_tools:?}"
+	);
+	assert_eq!(first_tools[0]["name"], "_agentgateway_tool_search");
+
+	let second: serde_json::Value = serde_json::from_slice(&model_requests[1].body).unwrap();
+	let second_tools = second["tools"].as_array().unwrap();
+	assert_eq!(
+		second_tools.len(),
+		2,
+		"the searched tool is appended after the search declaration: {second_tools:?}"
+	);
+	assert_eq!(second_tools[0]["name"], "_agentgateway_tool_search");
+	assert_eq!(second_tools[1]["name"], "managed");
+
+	let search_output = second["input"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.find(|item| item["type"] == "function_call_output" && item["call_id"] == "call_search_1")
+		.expect("the search result is replayed to the model");
+	assert!(
+		search_output["output"]
+			.as_str()
+			.unwrap()
+			.contains("managed"),
+		"{search_output:?}"
+	);
+
+	assert_eq!(tool.received_requests().await.unwrap().len(), 1);
+}

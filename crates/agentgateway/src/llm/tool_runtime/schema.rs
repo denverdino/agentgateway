@@ -60,3 +60,12 @@ pub(super) fn code_interpreter_parameters() -> Value {
 		"additionalProperties": false
 	})
 }
+
+pub(super) fn tool_search_parameters() -> Value {
+	json!({
+		"type": "object",
+		"properties": { "query": { "type": "string" } },
+		"required": ["query"],
+		"additionalProperties": false
+	})
+}

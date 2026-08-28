@@ -346,22 +346,34 @@ python3 examples/llm-tool-runtime/live_functional_test.py \
 
 The cases are `web-search`, `code-interpreter`, `combined`,
 `programmatic-server-tools`, `programmatic-mcp-weather`,
-`streaming-tool-runtime`, and `remote-mcp-weather`. The non-streaming cases
+`streaming-tool-runtime`, `remote-mcp-weather`, and
+`tool-search-weather-mcp`. The non-streaming cases
 check the HTTP response and final marker, then read the local AgentGateway
 metrics endpoint to prove the expected `http`, `e2b`, or `remote_mcp` backend
 recorded a successful tool call. `remote-mcp-weather` discovers the allowlisted
 `get_forecast` and `get_current_weather` tools from the authenticated FC Web
 Function configured by `FC_WEATHER_MCP_URL`, queries Beijing weather, and
 requires the final marker `WEATHER_MCP_BEIJING_OK`.
+`tool-search-weather-mcp` declares the same server with `defer_loading: true`
+alongside `{"type": "tool_search"}` and sends no `tool_choice`, so its
+declarations are withheld from the first model round. The live model has to call
+tool search, receive the injected declaration, and only then query Shanghai
+weather; the case requires an observed temperature plus the marker
+`TOOL_SEARCH_WEATHER_MCP_OK`, and asserts the declarations echo back with
+`defer_loading` intact and no reserved `_agentgateway` name. A successful
+`remote_mcp` metric is therefore only reachable through a search that injected
+the tool.
 `programmatic-mcp-weather` exposes only `weather.get_forecast` to Python,
 requests exactly three forecast days (the WeatherAPI Free-plan window), and
 requires the day with the highest daily maximum and the day with the lowest
 daily minimum (choosing the earliest date for ties), plus
-`PROGRAMMATIC_MCP_WEATHER_3DAY_OK` in the final answer. With `--show-output`,
-the harness also enables a narrowly scoped debug event and prints every Python
-program generated for this case in model-round order before the final answer.
-Generated code can contain tool arguments, so use this opt-in output only with
-non-sensitive test prompts.
+`PROGRAMMATIC_MCP_WEATHER_3DAY_OK` in the final answer. `--show-output` prints
+each case's final answer, and runs AgentGateway with `LOG_FORMAT=json` plus
+`RUST_LOG=info,agentgateway::llm::tool_runtime::runner=trace` so the generated
+Python is read back from the child log and printed before the answer. That TRACE
+event is the only place the program source is exposed — the debug level records
+sizes only. The source inlines the arguments the model passed to tools, so use
+this opt-in output only with non-sensitive test prompts.
 The `combined` request sets `parallel_tool_calls: true`; AgentGateway runs
 independent Tool Backend operations concurrently up to `maxParallelToolCalls`
 and restores model call order before the next round. Setting the field to
@@ -381,6 +393,11 @@ python3 examples/llm-tool-runtime/live_functional_test.py \
 python3 examples/llm-tool-runtime/live_functional_test.py \
   --binary ./target/release/agentgateway \
   --case programmatic-mcp-weather \
+  --show-output
+
+python3 examples/llm-tool-runtime/live_functional_test.py \
+  --binary ./target/release/agentgateway \
+  --case tool-search-weather-mcp \
   --show-output
 ```
 

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from typing import Any, List, Optional
 
 
 MODULE_PATH = Path(__file__).with_name("live_functional_test.py")
@@ -104,57 +106,87 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
 
         self.assertEqual(self.module.extract_output_text(response), "first\nsecond")
 
-    def test_extract_programmatic_tool_codes_reads_only_generated_code_events(self) -> None:
+    def _source_event(self, code: str) -> str:
+        return json.dumps(
+            {
+                "level": "trace",
+                "time": "2026-08-28T04:00:00.000000Z",
+                "scope": "agentgateway::llm::tool_runtime::runner",
+                "message": self.module.PROGRAM_SOURCE_MESSAGE,
+                "code": code,
+            }
+        )
+
+    def test_extract_program_sources_reads_only_source_events(self) -> None:
         logs = "\n".join(
             (
-                '{"level":"debug","scope":"agentgateway::llm::tool_runtime::runner",'
-                '"message":"generated programmatic tool call code",'
-                '"programmatic_code":"result = tools.call(\\"weather.get_forecast\\", '
-                '{\\"q\\": \\"Shanghai\\", \\"days\\": 3})\\nprogram_output(result)"}',
-                '{"level":"debug","scope":"agentgateway::llm::tool_runtime::runner",'
-                '"message":"another event","programmatic_code":"ignored"}',
-                '{"level":"debug","scope":"agentgateway::llm::tool_runtime::runner",'
-                '"message":"generated programmatic tool call code",'
-                '"programmatic_code":""}',
+                self._source_event(
+                    'result = tools.call("weather.get_forecast", '
+                    '{"q": "Shanghai", "days": 3})\nprogram_output(result)'
+                ),
+                json.dumps(
+                    {
+                        "level": "debug",
+                        "scope": "agentgateway::llm::tool_runtime::runner",
+                        "message": "generated programmatic tool call code",
+                        "code_bytes": 40,
+                    }
+                ),
+                self._source_event(""),
+                "not json at all",
             )
         )
 
         self.assertEqual(
-            self.module.extract_programmatic_tool_codes(logs),
+            self.module.extract_program_sources(logs),
             [
                 'result = tools.call("weather.get_forecast", '
                 '{"q": "Shanghai", "days": 3})\nprogram_output(result)'
             ],
         )
 
-    def test_print_case_output_includes_weather_program_code(self) -> None:
-        output = io.StringIO()
+    def test_read_program_sources_advances_past_only_complete_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_path = Path(temp_dir) / "agentgateway.log"
+            first = self._source_event("program_output(1)")
+            second = self._source_event("program_output(2)")
+            log_path.write_text(first + "\n" + second, encoding="utf-8")
 
+            sources, offset = self.module.read_program_sources(log_path, 0)
+
+            self.assertEqual(sources, ["program_output(1)"])
+            self.assertEqual(offset, len(first) + 1)
+
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write("\n")
+
+            self.assertEqual(
+                self.module.read_program_sources(log_path, offset),
+                (["program_output(2)"], len(first) + len(second) + 2),
+            )
+
+    def test_print_case_output_requires_a_program_for_the_weather_case(self) -> None:
+        with self.assertRaisesRegex(
+            self.module.HarnessFailure,
+            "did not capture generated program source",
+        ):
+            self.module.print_case_output("programmatic-mcp-weather", "text", ())
+
+        output = io.StringIO()
         with redirect_stdout(output):
             self.module.print_case_output(
-                "programmatic-mcp-weather",
-                "Shanghai forecast\nPROGRAMMATIC_MCP_WEATHER_3DAY_OK",
-                [
-                    'forecast = tools.call("weather.get_forecast", '
-                    '{"q": "Shanghai", "days": 3})\nprogram_output(forecast)',
-                    'program_output(tools.call("weather.get_forecast", '
-                    '{"q": "Shanghai", "days": 3}))',
-                ],
+                "programmatic-mcp-weather", "answer", ["program_output(1)"]
             )
+            # A case that never runs a program has nothing to report.
+            self.module.print_case_output("web-search", "plain", ())
 
         self.assertEqual(
             output.getvalue(),
-            "PROGRAMMATIC TOOL CALL CODE 1 (Python)\n"
-            'forecast = tools.call("weather.get_forecast", '
-            '{"q": "Shanghai", "days": 3})\n'
-            "program_output(forecast)\n"
-            "END PROGRAMMATIC TOOL CALL CODE 1\n"
-            "PROGRAMMATIC TOOL CALL CODE 2 (Python)\n"
-            'program_output(tools.call("weather.get_forecast", '
-            '{"q": "Shanghai", "days": 3}))\n'
-            "END PROGRAMMATIC TOOL CALL CODE 2\n"
-            "Shanghai forecast\n"
-            "PROGRAMMATIC_MCP_WEATHER_3DAY_OK\n",
+            "PROGRAM SOURCE 1 (Python)\n"
+            "program_output(1)\n"
+            "END PROGRAM SOURCE 1\n"
+            "answer\n"
+            "plain\n",
         )
 
     def test_case_payloads_expose_both_real_backends(self) -> None:
@@ -174,6 +206,7 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
                 "programmatic-mcp-weather",
                 "streaming-tool-runtime",
                 "remote-mcp-weather",
+                "tool-search-weather-mcp",
             },
         )
         self.assertEqual(cases["web-search"]["tools"], [{"type": "web_search"}])
@@ -245,6 +278,26 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
             },
         )
         self.assertIs(cases["remote-mcp-weather"]["enable_thinking"], False)
+        tool_search_weather = cases["tool-search-weather-mcp"]
+        self.assertEqual(
+            tool_search_weather["tools"],
+            [
+                {"type": "tool_search"},
+                {
+                    "type": "mcp",
+                    "server_label": "weather",
+                    "server_url": "https://weather.example.test/mcp",
+                    "authorization": "weather-mcp-token",
+                    "allowed_tools": ["get_forecast", "get_current_weather"],
+                    "require_approval": "never",
+                    "defer_loading": True,
+                },
+            ],
+        )
+        # A forced tool on a deferred server is injected eagerly, which would let the case pass
+        # without the model ever searching.
+        self.assertNotIn("tool_choice", tool_search_weather)
+        self.assertIn("TOOL_SEARCH_WEATHER_MCP_OK", tool_search_weather["input"])
         for payload in cases.values():
             self.assertEqual(payload["model"], "qwen3.6-flash")
         for case_name in (
@@ -254,33 +307,9 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
             "programmatic-server-tools",
             "programmatic-mcp-weather",
             "remote-mcp-weather",
+            "tool-search-weather-mcp",
         ):
             self.assertFalse(cases[case_name]["stream"])
-
-    def test_live_case_groups_isolate_each_visible_weather_program_log(self) -> None:
-        selected = [
-            "web-search",
-            "programmatic-server-tools",
-            "programmatic-mcp-weather",
-            "streaming-tool-runtime",
-            "programmatic-mcp-weather",
-            "remote-mcp-weather",
-        ]
-
-        self.assertEqual(
-            self.module.live_case_groups(selected, show_output=True),
-            [
-                ("web-search", "programmatic-server-tools"),
-                ("programmatic-mcp-weather",),
-                ("streaming-tool-runtime",),
-                ("programmatic-mcp-weather",),
-                ("remote-mcp-weather",),
-            ],
-        )
-        self.assertEqual(
-            self.module.live_case_groups(selected, show_output=False),
-            [tuple(selected)],
-        )
 
     def _run_programmatic_weather_case(self, output_text: str) -> str:
         response = {
@@ -353,6 +382,97 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
                 "2026-08-28: min 25 C, max 35 C\n"
                 "2026-08-29: min 26 C, max 34 C\n"
                 "PROGRAMMATIC_MCP_WEATHER_3DAY_OK"
+            )
+
+    def _run_tool_search_weather_case(
+        self, output_text: str, echoed_tools: Optional[List[Any]] = None
+    ) -> str:
+        deferred = {
+            "type": "mcp",
+            "server_label": "weather",
+            "server_url": "https://weather.example.test/mcp",
+            "authorization": "weather-mcp-token",
+            "allowed_tools": ["get_current_weather"],
+            "require_approval": "never",
+            "defer_loading": True,
+        }
+        payload_tools = [{"type": "tool_search"}, deferred]
+        if echoed_tools is None:
+            sanitized = {
+                key: value for key, value in deferred.items() if key != "authorization"
+            }
+            echoed_tools = [{"type": "tool_search"}, sanitized]
+        response = {
+            "status": "completed",
+            "tools": echoed_tools,
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": output_text}],
+                }
+            ],
+        }
+        metrics = iter(
+            (
+                "",
+                'agentgateway_tool_runtime_calls_total{tool="remote_mcp",'
+                'backend="remote_mcp",outcome="success"} 1',
+            )
+        )
+        original_post_json = self.module.post_json
+        original_fetch_metrics = self.module.fetch_metrics
+        self.module.post_json = lambda *_args: (200, response)
+        self.module.fetch_metrics = lambda _port: next(metrics)
+        try:
+            return self.module.run_case(
+                "http://127.0.0.1:8080",
+                15020,
+                "client-token",
+                "tool-search-weather-mcp",
+                {"model": "test", "tools": payload_tools},
+            )
+        finally:
+            self.module.post_json = original_post_json
+            self.module.fetch_metrics = original_fetch_metrics
+
+    def test_run_case_accepts_tool_search_weather_summary(self) -> None:
+        text = self._run_tool_search_weather_case(
+            "Shanghai is 30.2°C with patchy rain nearby.\nTOOL_SEARCH_WEATHER_MCP_OK"
+        )
+
+        self.assertIn("30.2", text)
+
+    def test_run_case_rejects_tool_search_weather_without_observed_value(self) -> None:
+        with self.assertRaisesRegex(
+            self.module.HarnessFailure, "omitted an observed temperature"
+        ):
+            self._run_tool_search_weather_case(
+                "I found a weather tool.\nTOOL_SEARCH_WEATHER_MCP_OK"
+            )
+
+    def test_run_case_rejects_tool_search_weather_losing_defer_loading(self) -> None:
+        with self.assertRaisesRegex(self.module.HarnessFailure, "did not round-trip"):
+            self._run_tool_search_weather_case(
+                "Shanghai is 30.2°C.\nTOOL_SEARCH_WEATHER_MCP_OK",
+                echoed_tools=[
+                    {"type": "tool_search"},
+                    {
+                        "type": "mcp",
+                        "server_label": "weather",
+                        "server_url": "https://weather.example.test/mcp",
+                        "allowed_tools": ["get_current_weather"],
+                        "require_approval": "never",
+                    },
+                ],
+            )
+
+    def test_run_case_rejects_tool_search_weather_leaking_reserved_name(self) -> None:
+        with self.assertRaisesRegex(
+            self.module.HarnessFailure, "reserved internal name"
+        ):
+            self._run_tool_search_weather_case(
+                "Shanghai is 30.2°C via _agentgateway_tool_search.\n"
+                "TOOL_SEARCH_WEATHER_MCP_OK"
             )
 
     def test_final_streaming_response_requires_lifecycle_delta_and_completion(self) -> None:

@@ -7,6 +7,8 @@
 - Implementation review: 8/26/2026
 - Programmatic Tool Calling extension: approved design, implementation pending
 - Programmatic Tool Calling design review: 8/27/2026
+- Tool Search extension: implemented
+- Tool Search design review: 8/27/2026
 
 > **Note:** The original managed Tool Runtime was reconciled with the current implementation on the implementation-review
 > date above. The Programmatic Tool Calling sections describe the approved follow-up implementation.
@@ -116,6 +118,16 @@ for requests that select a managed tool. The existing single-call proxy path rem
   retained.
 - Programmatic invocation of ordinary managed `function` or `custom` tools in the initial extension. Their existing
   direct execution path is unchanged.
+- Forwarding a client `tool_search` declaration to the upstream provider, or relying on any provider-native tool-search
+  implementation. AgentGateway executes the search itself so the feature works against every fronted model.
+- Embedding-based, model-based, or remotely served tool matching. Tool Search ranks candidates with deterministic local
+  lexical scoring so a search costs no extra network hop and no additional dependency.
+- Deferring `web_search` or `code_interpreter`. Each contributes exactly one declaration, so withholding it saves
+  nothing.
+- Exposing native `tool_search_call` and `tool_search_output` items to clients. Search calls and their results remain
+  internal to the managed loop, like `program` and `program_output`.
+- Unloading an injected tool definition later in the same request, or preserving the cached prefix across the injection
+  itself. Definitions are appended after the existing declarations and stay for the remainder of the request.
 
 ## API
 
@@ -486,6 +498,108 @@ program_output({
 The final program value contains exactly three daily records plus the period extrema. The following model round converts
 that reduced JSON value into the client-visible answer and preserves the exact test marker.
 
+### AgentGateway-executed Tool Search
+
+A large tool catalog is expensive before the model has chosen anything: one Remote MCP server alone can contribute 128
+declarations, and every one of them occupies the cached prompt prefix on every round. OpenAI's hosted Tool Search
+addresses this by letting a client declare `{"type": "tool_search"}` and mark individual tools `"defer_loading": true`;
+deferred definitions are withheld until the model searches for them.
+
+AgentGateway executes that search itself instead of forwarding the declaration upstream, so the behavior is identical
+across every fronted model and provider rather than being limited to providers that implement it natively. The mechanism
+reuses the existing managed loop: the search is one more reserved function, and loading a tool is one more mutation of
+the canonical request between rounds.
+
+A client declares Tool Search alongside its tools:
+
+```json
+{
+  "tools": [
+    {"type": "tool_search"},
+    {"type": "mcp", "server_label": "dice", "server_url": "https://example.test/mcp", "defer_loading": true},
+    {"type": "function", "name": "lookup", "parameters": {"type": "object"}, "defer_loading": true},
+    {
+      "type": "namespace",
+      "name": "weather",
+      "description": "Weather utilities",
+      "defer_loading": true,
+      "tools": [{"type": "function", "name": "forecast", "parameters": {"type": "object"}}]
+    }
+  ]
+}
+```
+
+`defer_loading` is accepted on managed `function` declarations, on `mcp` servers, and on the `namespace` type, where it
+is inherited by every member. Deferrable tools are exactly the ones that can contribute many declarations. `web_search`
+and `code_interpreter` contribute one each and are not deferrable.
+
+A `namespace` is flattened rather than forwarded: `collect_model_calls` rejects any model call carrying a `namespace`
+field, so a namespace declaration must never reach the model. Its members keep their original names as both public and
+internal name, and the namespace name and description are composed onto each member description exactly as a Remote MCP
+server label and description are composed onto its tools. The namespace name also becomes the member's search label.
+
+A deferred tool is withheld from `tools` and recorded in a request-local deferred catalog. In its place, AgentGateway
+declares one strict reserved function, `_agentgateway_tool_search`, taking a single required `query` string. Its
+description carries a bounded `label (names)` index of the deferred catalog grouped by MCP server label or namespace
+name, so the model can tell what is searchable without paying for full schemas. The index is regenerated after every
+Remote MCP server finishes discovery, because a deferred server's tool count is unknown until then.
+
+Matching is deterministic local lexical scoring. The query and each candidate's text are case-folded and split on
+whitespace, `_` and `.`. Each matched token scores 8 against the public name, 4 against the label, and 2 against the
+description; a prefix-only match scores half, and tokens shorter than three bytes are not eligible to prefix-match at
+all, since they would match most of a catalog and displace better candidates from the bounded result set. The tier
+weights are even so that halving stays meaningful at every tier. Candidates are sorted by score descending and tie-broken
+on internal name so results are stable, zero-scoring candidates stay deferred, and the top `MAX_TOOL_SEARCH_RESULTS` are
+returned. This costs no network hop and adds no dependency, which is why it is preferred to embedding or model-based
+matching.
+
+A group that would exceed the index budget is truncated within itself and marked `+N more` rather than dropped whole. One
+MCP server contributes one label and therefore one group, so dropping the group would leave the model with no searchable
+listing at all and silently disable the feature for exactly the large catalogs it exists to serve.
+
+A search is executed in process. There is no Tool backend and no new execution result variant: the winning declarations
+are appended to the end of `tools` and the model sees an ordinary `function_call_output` containing
+`{"tools": [...], "ok": true}`. Appending rather than inserting keeps the previously cached declarations byte-identical.
+Injection is idempotent — a repeated search still reports the definitions but never declares the same tool name twice,
+which would otherwise be an upstream 400.
+
+Search internals stay private. No `tool_search_call` or `tool_search_output` item is synthesized, and because only the
+terminating round's output is returned to the client, no `_agentgateway_tool_search` call or result crosses the client
+boundary. The client's original `tools` array, including `tool_search`, `namespace` and `defer_loading`, is echoed back
+verbatim in the final response.
+
+Bounds are request-local constants, sized against the existing Remote MCP limits:
+
+| Bound | Value | Rationale |
+| --- | --- | --- |
+| `MAX_DEFERRED_TOOLS` | `4 × MAX_DISCOVERED_TOOLS` | The deferred catalog is the point of the feature, so it is allowed to exceed one server's discovery limit. |
+| `MAX_TOOL_SEARCH_RESULTS` | 8 | One search reports a reviewable set rather than a second catalog. |
+| `MAX_INJECTED_TOOLS` | `MAX_TOOL_SEARCH_RESULTS × MAX_TOOL_SEARCH_CALLS - 1` | Caps total context growth across all searches in one request. Set one below what the permitted searches can inject, so the cap binds rather than being unreachable behind the other two limits. |
+| `MAX_TOOL_SEARCH_CALLS` | 8 | Matches the default round limit. |
+| `MAX_TOOL_SEARCH_INDEX_BYTES` | 32 KiB | The index lives in the cached prefix, so it is bounded far below the 2 MiB programmatic catalog. |
+
+Neither the search-call nor the injected-tool limit fails the request, so the model can still finish with the tools it
+already has. Exceeding the search-call limit returns an application error, because nothing was injected. Reaching the
+injected-tool limit is instead a partial success: the declarations appended before the cap are live for the next round,
+so the search reports them together with `truncated: true`. Search calls are counted against `max_tool_calls` even
+though they bypass the Tool backend batch.
+
+The following declarations are rejected as `invalid_request`:
+
+- `defer_loading: true` with no `tool_search` declaration, which would make the tool unreachable.
+- `tool_search` declared but nothing deferred, checked after Remote MCP discovery.
+- A duplicate or optioned `tool_search` declaration, matching `web_search` handling.
+- `defer_loading` combined with programmatic `allowed_callers`, because the programmatic catalog is embedded in the
+  initial-context description and gating it later would invalidate the cached prefix anyway.
+- `tool_choice` forcing a deferred function by name, which would omit that declaration from the very round that requires
+  it.
+- `defer_loading` on any other tool type, including passthrough types the gateway forwards untouched. The provider would
+  receive a `defer_loading` the gateway consumed the `tool_search` declaration for, and the gateway holds no catalog
+  entry to search the tool back into context.
+
+A `tool_choice` of type `mcp` naming a tool on a deferred server is not rejected. That one declaration is injected
+eagerly instead, consistent with the existing forced-MCP translation path.
+
 ## Runtime Design
 
 ### Components
@@ -687,6 +801,13 @@ User-controlled or high-cardinality content—including remote MCP server/tool n
 result URLs, endpoint, request ID, and Sandbox ID—is excluded from metric labels and runtime spans. Remote MCP calls use
 the bounded telemetry tool label `remote_mcp`.
 
+Debug logs are content-free for the same reason: the programmatic path logs program sizes, replay entry counts and
+durations, never the program itself. Debugging a generated program does need the source, so it is emitted on a single
+`trace` event on the `agentgateway::llm::tool_runtime::runner` target, off by default and enabled explicitly with
+`RUST_LOG=info,agentgateway::llm::tool_runtime::runner=trace`. The split is deliberate: the source inlines the arguments
+the model passed to tools, so raising a target to `trace` is the operator's opt-in to logging request content, while
+`debug` stays safe to enable in production.
+
 ## Controller and xDS
 
 The initial implementation adds no controller translation, CRD, protobuf, or xDS resource. `llm.toolRuntime` is a local
@@ -833,6 +954,27 @@ because it reuses the existing backend and keeps all tool authorization in the g
 - Add the opt-in `programmatic-mcp-weather` live case using the existing FC WeatherAPI Remote MCP server. Require
   `PROGRAMMATIC_MCP_WEATHER_3DAY_OK`, three forecast-day high/low entries, a successful `remote_mcp` metric delta, and
   successful E2B Sandbox operations.
+- Unit-test Tool Search declaration validation: a duplicate or optioned `tool_search`, `defer_loading` without
+  `tool_search`, `tool_search` with nothing deferred after discovery, `defer_loading` combined with programmatic
+  `allowed_callers`, and a `tool_choice` forcing a deferred function.
+- Unit-test that a deferred Remote MCP server contributes no function declarations, that exactly one
+  `_agentgateway_tool_search` declaration is produced, and that its index names the server and its public tool names but
+  never the reserved internal names.
+- Unit-test that a search appends matching declarations after the existing ones, that a repeated search still reports the
+  definitions without declaring a name twice, and that a zero-scoring candidate stays deferred.
+- Unit-test that a `namespace` declaration is never forwarded, that its members are injected under their original names,
+  and that the namespace name and description are composed onto each member description.
+- Unit-test the deferred-catalog, search-index, and search-call bounds, including that exceeding the call limit yields a
+  `tool_search_limit` application error rather than a request failure, and that search calls count against
+  `max_tool_calls`.
+- Test the full loop through the runner and through the proxy: the first round declares only the search function, the
+  second round contains the searched declaration and replays the search output, the request terminates normally, and no
+  `_agentgateway_tool_search` item or the deferred catalog reaches the client while the client's original `tools` array
+  round-trips verbatim.
+- Add a `tool-search-deferred` release-binary functional case that drives a deferred managed function through public
+  `/v1/responses` against a local HTTP tool mock, asserting three model rounds, the round-one index without a
+  declaration, the round-two appended declaration, one tool-backend request, aggregate usage, and a client body free of
+  reserved names.
 
 ## Open Questions
 

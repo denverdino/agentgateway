@@ -5,9 +5,10 @@ use async_trait::async_trait;
 
 use super::{
 	CollectedToolCalls, ManagedFinalResponse, PreparedToolRuntime, ProgramOutcome,
-	ProgramReplayEntry, RuntimeBudget, ToolApplicationError, ToolExecutionResult, ToolRuntimeError,
-	ToolRuntimeOutcome, ToolRuntimeSummary, aggregate_usage, build_sandbox_request, execute_batch,
-	finalize_managed_response, fit_replay_entry, has_replay_entry_capacity, parse_sandbox_outcome,
+	ProgramReplayEntry, RuntimeBudget, TOOL_SEARCH_FUNCTION, ToolApplicationError,
+	ToolExecutionResult, ToolRuntimeError, ToolRuntimeOutcome, ToolRuntimeSummary, aggregate_usage,
+	build_sandbox_request, execute_batch, finalize_managed_response, fit_replay_entry,
+	has_replay_entry_capacity, parse_sandbox_outcome,
 };
 use crate::http::Response;
 use crate::llm::BufferedResponsesRound;
@@ -154,7 +155,7 @@ pub(crate) async fn run(
 			});
 		}
 
-		let outputs = match Box::pin(execute_collected(&runtime, collected, &mut budget)).await {
+		let outputs = match Box::pin(execute_collected(&mut runtime, collected, &mut budget)).await {
 			Ok(outputs) => outputs,
 			Err(error) => return Err(finish_runtime_error(&mut budget, error)),
 		};
@@ -163,18 +164,69 @@ pub(crate) async fn run(
 }
 
 async fn execute_collected(
-	runtime: &PreparedToolRuntime,
+	runtime: &mut PreparedToolRuntime,
 	collected: CollectedToolCalls,
 	budget: &mut RuntimeBudget,
 ) -> Result<Vec<serde_json::Value>, ToolRuntimeError> {
 	match collected {
-		CollectedToolCalls::Direct(calls) => {
-			execute_batch(&runtime.registry, calls, runtime.parallel, budget).await
-		},
+		CollectedToolCalls::Direct(calls) => Box::pin(execute_direct(runtime, calls, budget)).await,
 		CollectedToolCalls::Programmatic { call_id, code } => {
 			execute_program(runtime, call_id, code, budget).await
 		},
 	}
+}
+
+/// Execute a direct batch, splitting out the tool search calls the gateway serves itself.
+async fn execute_direct(
+	runtime: &mut PreparedToolRuntime,
+	calls: Vec<super::ManagedToolCall>,
+	budget: &mut RuntimeBudget,
+) -> Result<Vec<serde_json::Value>, ToolRuntimeError> {
+	let searches = calls
+		.iter()
+		.filter(|call| call.internal_name == TOOL_SEARCH_FUNCTION)
+		.count();
+	if searches == 0 {
+		return execute_batch(&runtime.registry, calls, runtime.parallel, budget).await;
+	}
+	// A search never reaches a backend, so it escapes `execute_batch`'s accounting.
+	if let Err(error) = budget.reserve_calls(searches) {
+		budget.record_error(&error);
+		return Err(error);
+	}
+	let mut outputs = Vec::with_capacity(calls.len());
+	let mut backed = Vec::with_capacity(calls.len() - searches);
+	for call in calls {
+		if call.internal_name == TOOL_SEARCH_FUNCTION {
+			let query = call
+				.arguments
+				.get("query")
+				.and_then(serde_json::Value::as_str)
+				.ok_or_else(ToolRuntimeError::internal)?
+				.to_owned();
+			let result = runtime.execute_tool_search(&query)?;
+			outputs.push(tool_output_item(
+				call.call_id,
+				result,
+				budget.max_output_bytes(),
+			)?);
+		} else {
+			// Reserve the slot so the merged transcript keeps the model's original call order.
+			outputs.push(serde_json::Value::Null);
+			backed.push((outputs.len() - 1, call));
+		}
+	}
+	if !backed.is_empty() {
+		let (slots, calls): (Vec<usize>, Vec<super::ManagedToolCall>) = backed.into_iter().unzip();
+		let executed = execute_batch(&runtime.registry, calls, runtime.parallel, budget).await?;
+		if executed.len() != slots.len() {
+			return Err(ToolRuntimeError::internal());
+		}
+		for (slot, output) in slots.into_iter().zip(executed) {
+			outputs[slot] = output;
+		}
+	}
+	Ok(outputs)
 }
 
 async fn execute_program(
@@ -187,6 +239,8 @@ async fn execute_program(
 		code_bytes = code.len(),
 		"generated programmatic tool call code"
 	);
+	// The source inlines model-supplied tool arguments, so it stays off the content-free debug path.
+	tracing::trace!(code = %code, "programmatic tool call program source");
 	let mut replay = Vec::new();
 	let program_execution_id = uuid::Uuid::new_v4().simple().to_string();
 	let program_started = Instant::now();
@@ -309,13 +363,22 @@ fn synthetic_program_output(
 	result: ToolExecutionResult,
 	max_output_bytes: usize,
 ) -> Result<Vec<serde_json::Value>, ToolRuntimeError> {
+	Ok(vec![tool_output_item(call_id, result, max_output_bytes)?])
+}
+
+/// Build the `function_call_output` item for a tool the gateway resolved without a backend round trip.
+fn tool_output_item(
+	call_id: agent_core::prelude::Strng,
+	result: ToolExecutionResult,
+	max_output_bytes: usize,
+) -> Result<serde_json::Value, ToolRuntimeError> {
 	let output = result.into_model_output(max_output_bytes)?;
 	let output = serde_json::to_string(&output).map_err(|_| ToolRuntimeError::internal())?;
-	Ok(vec![serde_json::json!({
+	Ok(serde_json::json!({
 		"type": "function_call_output",
 		"call_id": call_id,
 		"output": output,
-	})])
+	}))
 }
 
 fn summary(
@@ -331,7 +394,7 @@ fn summary(
 		tool_calls: _budget.tool_calls(),
 		client_streaming: runtime.client_streaming,
 		include_obfuscation: runtime.include_obfuscation,
-		client_tools: runtime.client_tools.clone(),
+		client_tools: runtime.client_tools.as_deref().cloned(),
 	}
 }
 

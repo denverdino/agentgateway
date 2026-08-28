@@ -17,7 +17,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -130,7 +130,18 @@ fn saturating_add_optional(left: Option<u64>, right: Option<u64>) -> Option<u64>
 pub(crate) const WEB_SEARCH_FUNCTION: &str = "_agentgateway_web_search";
 pub(crate) const CODE_INTERPRETER_FUNCTION: &str = "_agentgateway_code_interpreter";
 pub(crate) const PROGRAMMATIC_FUNCTION: &str = "_agentgateway_programmatic_tool_calling";
+pub(crate) const TOOL_SEARCH_FUNCTION: &str = "_agentgateway_tool_search";
 pub(crate) const REMOTE_MCP_FUNCTION_PREFIX: &str = "_agentgateway_mcp_";
+pub(crate) const MAX_DEFERRED_TOOLS: usize = 4 * remote_mcp::MAX_DISCOVERED_TOOLS;
+pub(crate) const MAX_TOOL_SEARCH_RESULTS: usize = 8;
+pub(crate) const MAX_TOOL_SEARCH_CALLS: usize = 8;
+// Below what the permitted searches can inject, so the cap binds instead of being unreachable behind
+// the per-search and per-request limits. An eagerly injected forced tool lowers the reachable ceiling
+// further, since it takes a slot without spending a search.
+pub(crate) const MAX_INJECTED_TOOLS: usize = MAX_TOOL_SEARCH_RESULTS * MAX_TOOL_SEARCH_CALLS - 1;
+// The index rides in the search tool's description, which lives in the cached prompt prefix, so it is
+// bounded far more tightly than the 2 MiB programmatic catalog.
+pub(crate) const MAX_TOOL_SEARCH_INDEX_BYTES: usize = 32 * 1024;
 pub(crate) const SANDBOX_MAX_BATCH_EXECUTIONS: usize = 8;
 pub(crate) const SANDBOX_MAX_CALL_ID_BYTES: usize = 256;
 pub(crate) const SANDBOX_MAX_CODE_BYTES: usize = 32 * 1024;
@@ -168,6 +179,141 @@ pub(crate) struct ProgrammaticToolSpec {
 	pub(crate) output_schema: Option<Value>,
 }
 
+/// Case-folded tokens for lexical matching, split on the separators that appear in tool names
+/// (`_`, `.`) as well as whitespace.
+fn search_tokens(text: &str) -> Vec<String> {
+	text
+		.split(|character: char| character.is_whitespace() || character == '_' || character == '.')
+		.filter(|token| !token.is_empty())
+		.map(str::to_lowercase)
+		.collect()
+}
+
+/// Shortest token allowed to match on a prefix. Below this a token prefix-matches so much of a
+/// catalog that it only displaces better candidates from the bounded result set.
+const MIN_PREFIX_MATCH_BYTES: usize = 3;
+
+/// Sum of per-query-token scores against `text`: full weight for an exact token match, half for a
+/// prefix-only match. Tier weights are even so that halving is meaningful at every tier.
+fn token_score(query_tokens: &[String], text: &str, weight: usize) -> usize {
+	let candidates = search_tokens(text);
+	if candidates.is_empty() {
+		return 0;
+	}
+	query_tokens
+		.iter()
+		.map(|query| {
+			if candidates.iter().any(|candidate| candidate == query) {
+				weight
+			} else if candidates.iter().any(|candidate| {
+				query.len() >= MIN_PREFIX_MATCH_BYTES
+					&& candidate.len() >= MIN_PREFIX_MATCH_BYTES
+					&& (candidate.starts_with(query.as_str()) || query.starts_with(candidate))
+			}) {
+				weight / 2
+			} else {
+				0
+			}
+		})
+		.sum()
+}
+
+/// Room reserved so a truncated group can always append its `+N more` marker.
+const INDEX_ELISION_BYTES: usize = 32;
+
+/// A compact `label (names)` listing of the deferred catalog, bounded so it cannot bloat the cached
+/// prompt prefix.
+fn tool_search_index(deferred: &[DeferredTool]) -> String {
+	let mut groups: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+	for tool in deferred {
+		groups
+			.entry(tool.label.as_deref().unwrap_or(""))
+			.or_default()
+			.insert(tool.public_name.as_str());
+	}
+	let mut index = String::new();
+	for (label, names) in groups {
+		// Truncate within the group rather than dropping it: one MCP server contributes one label, so
+		// dropping the group would leave the model with no searchable listing at all.
+		let mut entry = if label.is_empty() {
+			String::new()
+		} else {
+			format!("{label} (")
+		};
+		let close = if label.is_empty() { "; " } else { "); " };
+		let mut listed = 0;
+		for name in &names {
+			let separator = if listed == 0 { "" } else { ", " };
+			if index.len()
+				+ entry.len()
+				+ separator.len()
+				+ name.len()
+				+ close.len()
+				+ INDEX_ELISION_BYTES
+				> MAX_TOOL_SEARCH_INDEX_BYTES
+			{
+				break;
+			}
+			entry.push_str(separator);
+			entry.push_str(name);
+			listed += 1;
+		}
+		// Framing with no tool name is worthless to the model, and the budget that starved this group
+		// only shrinks from here, so stop instead of emitting it.
+		if listed == 0 {
+			break;
+		}
+		if listed < names.len() {
+			entry.push_str(&format!(", +{} more", names.len() - listed));
+		}
+		entry.push_str(close);
+		index.push_str(&entry);
+	}
+	index
+}
+
+/// Deterministic lexical ranking over the deferred catalog. Returns indices into `deferred`, best
+/// first, with ties broken by internal name so output is stable.
+fn score_deferred_tools(deferred: &[DeferredTool], query: &str) -> Vec<usize> {
+	let query_tokens = search_tokens(query);
+	let mut scored = deferred
+		.iter()
+		.enumerate()
+		.map(|(index, tool)| {
+			let score = if query_tokens.is_empty() {
+				0
+			} else {
+				token_score(&query_tokens, tool.public_name.as_str(), 8)
+					+ token_score(&query_tokens, tool.label.as_deref().unwrap_or(""), 4)
+					+ token_score(&query_tokens, &tool.description, 2)
+			};
+			(score, index)
+		})
+		.collect::<Vec<_>>();
+	// An unmatched tool must stay deferred: injecting it would spend context on nothing.
+	scored.retain(|(score, _)| *score > 0);
+	scored.sort_by(|left, right| {
+		right.0.cmp(&left.0).then_with(|| {
+			deferred[left.1]
+				.internal_name
+				.cmp(&deferred[right.1].internal_name)
+		})
+	});
+	scored.truncate(MAX_TOOL_SEARCH_RESULTS);
+	scored.into_iter().map(|(_, index)| index).collect()
+}
+
+/// A tool withheld from the initial model context until `tool_search` discovers it.
+#[derive(Clone, Debug)]
+pub(crate) struct DeferredTool {
+	pub(crate) internal_name: Strng,
+	pub(crate) public_name: Strng,
+	/// Namespace name or MCP server label; scored and shown in the search index.
+	pub(crate) label: Option<String>,
+	pub(crate) description: String,
+	pub(crate) declaration: Value,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RuntimeDeadline(tokio::time::Instant);
 
@@ -197,9 +343,30 @@ pub(crate) struct PreparedToolRuntime {
 	pub(crate) parallel: bool,
 	pub(crate) client_streaming: bool,
 	pub(crate) include_obfuscation: bool,
-	pub(crate) client_tools: Option<Value>,
+	/// Boxed for the same reason as `tool_search`: this is only read when finalizing the response.
+	pub(crate) client_tools: Option<Box<Value>>,
 	pub(crate) deadline: RuntimeDeadline,
 	pub(crate) pending_remote_mcp: Vec<RemoteMcpServer>,
+	/// Present exactly when the request declared `tool_search`. Boxed to keep `PreparedToolRuntime`
+	/// small: it lives by value inside the proxy's backend-call future, which is size-asserted.
+	tool_search: Option<Box<ToolSearchState>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ToolSearchState {
+	deferred_tools: Vec<DeferredTool>,
+	injected_tools: HashSet<Strng>,
+	calls: usize,
+}
+
+impl ToolSearchState {
+	pub(crate) fn new(deferred_tools: Vec<DeferredTool>) -> Self {
+		Self {
+			deferred_tools,
+			injected_tools: HashSet::new(),
+			calls: 0,
+		}
+	}
 }
 
 #[derive(Debug)]
@@ -216,6 +383,7 @@ pub(crate) struct RemoteMcpServer {
 	pub authorization: Option<secrecy::SecretString>,
 	pub allowed_tools: Option<Vec<String>>,
 	pub allowed_callers: AllowedCallers,
+	pub defer_loading: bool,
 }
 
 impl PreparedToolRuntime {
@@ -245,6 +413,7 @@ impl PreparedToolRuntime {
 		}
 		self.pending_remote_mcp.clear();
 		self.refresh_programmatic_schema()?;
+		self.refresh_tool_search_schema()?;
 		if self
 			.canonical_request
 			.rest_field("tool_choice")
@@ -270,6 +439,7 @@ impl PreparedToolRuntime {
 		let server_label = server.server_label.clone();
 		let server_description = server.server_description.clone();
 		let allowed_callers = server.allowed_callers;
+		let defer_loading = server.defer_loading;
 		let mut declarations = self
 			.canonical_request
 			.rest_field("tools")
@@ -294,14 +464,46 @@ impl PreparedToolRuntime {
 				(None, None) => format!("Tool from remote MCP server {}", server_label),
 			};
 			let description = truncate_utf8(description, remote_mcp::MAX_DESCRIPTION_BYTES);
+			let declaration = json!({
+				"type": "function",
+				"name": internal_name,
+				"description": description,
+				"strict": false,
+				"parameters": tool.input_schema,
+			});
+			let forced_mcp_tool = self
+				.canonical_request
+				.rest_field("tool_choice")
+				.and_then(Value::as_object)
+				.filter(|choice| choice.get("type").and_then(Value::as_str) == Some("mcp"))
+				.filter(|choice| {
+					choice.get("server_label").and_then(Value::as_str) == Some(server_label.as_str())
+				})
+				.and_then(|choice| choice.get("name").and_then(Value::as_str))
+				== Some(tool.remote_name.as_str());
 			if allowed_callers.direct {
-				declarations.push(json!({
-					"type": "function",
-					"name": internal_name,
-					"description": description,
-					"strict": false,
-					"parameters": tool.input_schema,
-				}));
+				// A forced tool must be declared in the very first round, so deferral cannot apply to it.
+				match self.tool_search.as_mut().filter(|_| defer_loading) {
+					Some(state) if !forced_mcp_tool => {
+						if state.deferred_tools.len() >= MAX_DEFERRED_TOOLS {
+							return Err(ToolRuntimeError::invalid_request(format!(
+								"deferred tool catalog exceeds the {MAX_DEFERRED_TOOLS}-tool limit"
+							)));
+						}
+						state.deferred_tools.push(DeferredTool {
+							internal_name: internal_name.clone(),
+							public_name: public_name.clone(),
+							label: Some(server_label.clone()),
+							description: description.clone(),
+							declaration,
+						});
+					},
+					Some(state) => {
+						state.injected_tools.insert(internal_name.clone());
+						declarations.push(declaration);
+					},
+					None => declarations.push(declaration),
+				}
 			}
 			if allowed_callers.programmatic {
 				if self.programmatic_tools.contains_key(public_name.as_str()) {
@@ -324,16 +526,6 @@ impl PreparedToolRuntime {
 				Arc::make_mut(&mut self.programmatic_tools).insert(public_name.clone(), spec);
 				self.programmatic_catalog_bytes = next_size;
 			}
-			let forced_mcp_tool = self
-				.canonical_request
-				.rest_field("tool_choice")
-				.and_then(Value::as_object)
-				.filter(|choice| choice.get("type").and_then(Value::as_str) == Some("mcp"))
-				.filter(|choice| {
-					choice.get("server_label").and_then(Value::as_str) == Some(server_label.as_str())
-				})
-				.and_then(|choice| choice.get("name").and_then(Value::as_str))
-				== Some(tool.remote_name.as_str());
 			if forced_mcp_tool && allowed_callers.direct {
 				self.canonical_request.replace_rest_field(
 					"tool_choice",
@@ -363,7 +555,119 @@ impl PreparedToolRuntime {
 		tools: Vec<RemoteMcpTool>,
 	) -> Result<(), ToolRuntimeError> {
 		self.install_remote_mcp_tools(server_index, backend, tools)?;
-		self.refresh_programmatic_schema()
+		self.refresh_programmatic_schema()?;
+		self.refresh_tool_search_schema()
+	}
+
+	/// Rebuild the `tool_search` declaration so its index reflects the current deferred catalog.
+	pub(crate) fn refresh_tool_search_schema(&mut self) -> Result<(), ToolRuntimeError> {
+		let mut declarations = self
+			.canonical_request
+			.rest_field("tools")
+			.and_then(Value::as_array)
+			.cloned()
+			.unwrap_or_default();
+		declarations
+			.retain(|tool| tool.get("name").and_then(Value::as_str) != Some(TOOL_SEARCH_FUNCTION));
+		let description = match self.tool_search.as_ref() {
+			None => None,
+			// A deferred MCP server contributes nothing until it is discovered, so an empty catalog is
+			// only an error once every pending server has been installed.
+			Some(state) if state.deferred_tools.is_empty() => {
+				if self.pending_remote_mcp.is_empty() {
+					return Err(ToolRuntimeError::invalid_request(
+						"tool_search requires at least one tool with defer_loading",
+					));
+				}
+				None
+			},
+			Some(state) => Some(format!(
+				"Search for additional tools that are not yet loaded, then call the tools it returns. \
+				 Groups available to search: {}",
+				tool_search_index(&state.deferred_tools)
+			)),
+		};
+		if let Some(description) = description {
+			declarations.push(json!({
+				"type": "function",
+				"name": TOOL_SEARCH_FUNCTION,
+				"description": description,
+				"strict": true,
+				"parameters": schema::tool_search_parameters()
+			}));
+		}
+		self
+			.canonical_request
+			.replace_rest_field("tools", Value::Array(declarations));
+		Ok(())
+	}
+
+	/// Score the deferred catalog, append the winning declarations to the request, and return the
+	/// model-visible result. Injection is idempotent: a repeated search still reports the definitions
+	/// but never declares the same tool name twice.
+	pub(crate) fn execute_tool_search(
+		&mut self,
+		query: &str,
+	) -> Result<ToolExecutionResult, ToolRuntimeError> {
+		let state = self.tool_search.as_mut().ok_or_else(|| {
+			ToolRuntimeError::invalid_request("tool search was not declared for this request")
+		})?;
+		state.calls += 1;
+		if state.calls > MAX_TOOL_SEARCH_CALLS {
+			return Ok(ToolExecutionResult::ApplicationError(
+				ToolApplicationError::new(
+					"tool_search_limit",
+					"tool search call limit reached; continue with the tools already loaded",
+					false,
+					"",
+					"",
+				),
+			));
+		}
+		let matches = score_deferred_tools(&state.deferred_tools, query);
+		let mut declarations = self
+			.canonical_request
+			.rest_field("tools")
+			.and_then(Value::as_array)
+			.cloned()
+			.unwrap_or_default();
+		let mut reported = Vec::with_capacity(matches.len());
+		let mut capped = false;
+		for index in matches {
+			let tool = &state.deferred_tools[index];
+			if !state.injected_tools.contains(tool.internal_name.as_str()) {
+				// Stop at the cap rather than returning, so the declarations appended above are still written
+				// back. A tool recorded as injected but left undeclared would be stranded: the dedup check
+				// above skips it on every later search.
+				if state.injected_tools.len() >= MAX_INJECTED_TOOLS {
+					capped = true;
+					break;
+				}
+				state.injected_tools.insert(tool.internal_name.clone());
+				declarations.push(tool.declaration.clone());
+			}
+			// Only report what is now declared: a reported tool the model cannot call is worse than an
+			// omission, because `collect_model_calls` rejects the call it invites.
+			reported.push(json!({
+				"type": "function",
+				"name": tool.public_name,
+				"description": tool.description,
+				"parameters": tool.declaration.get("parameters").cloned().unwrap_or(Value::Null),
+			}));
+		}
+		self
+			.canonical_request
+			.replace_rest_field("tools", Value::Array(declarations));
+		// Hitting the cap is a partial success, not a failure: these declarations are live for the next
+		// round, so report them alongside the truncation rather than sending a bare error.
+		if capped {
+			return Ok(ToolExecutionResult::function(json!({
+				"tools": reported,
+				"truncated": true,
+				"note": "loaded tool limit reached; continue with the tools already loaded",
+			})));
+		}
+		Ok(ToolExecutionResult::function(json!({"tools": reported})))
 	}
 
 	pub(crate) fn refresh_programmatic_schema(&mut self) -> Result<(), ToolRuntimeError> {
@@ -543,6 +847,29 @@ impl PreparedToolRuntime {
 					"model generated undeclared managed tool {}",
 					call.name
 				)));
+			}
+			// Tool search runs inside the gateway, so it has no backend and no registry entry.
+			if call.name == TOOL_SEARCH_FUNCTION {
+				let arguments = parse_arguments(
+					call.arguments.as_bytes(),
+					self.registry.limits.max_arguments_bytes,
+				)?;
+				if !arguments
+					.get("query")
+					.is_some_and(|query| query.is_string())
+				{
+					return Err(ToolRuntimeError::invalid_request(
+						"tool search call requires a string query",
+					));
+				}
+				calls.push(ManagedToolCall {
+					public_name: Strng::from(TOOL_SEARCH_FUNCTION),
+					internal_name: Strng::from(TOOL_SEARCH_FUNCTION),
+					call_id: Strng::from(call.call_id.clone()),
+					arguments,
+					trusted_options: Value::Object(Default::default()),
+				});
+				continue;
 			}
 			let registered = self
 				.registry
@@ -1228,7 +1555,7 @@ impl RuntimeBudget {
 		self.telemetry.records()
 	}
 
-	fn reserve_calls(&mut self, count: usize) -> Result<usize, ToolRuntimeError> {
+	pub(crate) fn reserve_calls(&mut self, count: usize) -> Result<usize, ToolRuntimeError> {
 		let start = self.next_execution_index;
 		let total = self.tool_calls.checked_add(count).ok_or_else(|| {
 			ToolRuntimeError::limit(

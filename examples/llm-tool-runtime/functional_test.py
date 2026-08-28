@@ -35,6 +35,7 @@ CASE_NAMES = (
     "multi-code-reuse",
     "active-mode-rejections",
     "unmanaged-function-passthrough",
+    "tool-search-deferred",
 )
 MAX_HTTP_BODY_BYTES = 1024 * 1024
 REQUEST_TIMEOUT_SECONDS = 5.0
@@ -152,6 +153,7 @@ class MockState:
         self.lock = threading.Lock()
         self.model_requests: DefaultDict[str, List[Dict[str, Any]]] = defaultdict(list)
         self.web_requests: List[Dict[str, Any]] = []
+        self.catalog_requests: List[Dict[str, Any]] = []
         self.sandbox_requests: List[Dict[str, Any]] = []
         self.pending_sandbox_scenarios: List[str] = []
         self.active_sandbox_scenario: Optional[str] = None
@@ -173,6 +175,10 @@ class MockState:
     def record_web(self, scenario: str, request: Dict[str, Any]) -> None:
         with self.lock:
             self.web_requests.append(request)
+
+    def record_catalog(self, request: Dict[str, Any]) -> None:
+        with self.lock:
+            self.catalog_requests.append(request)
 
     def begin_sandbox(self) -> Tuple[str, str]:
         with self.lock:
@@ -252,6 +258,7 @@ def detect_model_scenario(payload: Mapping[str, Any]) -> str:
         ("programmatic-server-tools", "functional-programmatic"),
         ("web-search-single", "functional-web-only"),
         ("multi-code-reuse", "functional-multi-code"),
+        ("tool-search-deferred", "functional-tool-search"),
     ):
         if input_contains(payload, marker):
             return scenario
@@ -346,6 +353,35 @@ def model_response(scenario: str, payload: Mapping[str, Any]) -> Dict[str, Any]:
             ],
             6,
             3,
+        )
+    if scenario == "tool-search-deferred":
+        # The catalog call is the marker for the last round: its output only exists after the
+        # searched declaration was injected and actually called.
+        if input_contains(payload, "catalog-call-1"):
+            return response_body(
+                "resp_search_final",
+                [message("msg_search_final", "deferred tool answer")],
+                9,
+                4,
+            )
+        if continuation:
+            return response_body(
+                "resp_search_call",
+                [function_call("catalog_lookup", "catalog-call-1", {"sku": "AG-1"})],
+                7,
+                3,
+            )
+        return response_body(
+            "resp_search_probe",
+            [
+                function_call(
+                    "_agentgateway_tool_search",
+                    "search-call-1",
+                    {"query": "catalog lookup"},
+                )
+            ],
+            5,
+            2,
         )
     if scenario == "unmanaged-function-passthrough":
         return response_body(
@@ -470,6 +506,28 @@ class WebSearchHandler(QuietHandler):
             )
         except Exception:
             state.record_error("Web Search mock rejected a request")
+            self.send_safe_failure()
+
+
+class CatalogHandler(QuietHandler):
+    def do_POST(self) -> None:
+        state = self.server.state  # type: ignore[attr-defined]
+        try:
+            self.require_contract("/lookup", "functional-catalog-token")
+            request = self.read_json()
+            require(
+                request.get("tool_name") == "catalog_lookup",
+                "catalog mock received the wrong tool name",
+            )
+            arguments = request.get("arguments")
+            require(
+                isinstance(arguments, dict) and arguments.get("sku") == "AG-1",
+                "catalog mock received unexpected arguments",
+            )
+            state.record_catalog(request)
+            self.send_json(200, {"sku": "AG-1", "in_stock": 3})
+        except Exception:
+            state.record_error("catalog mock rejected a request")
             self.send_safe_failure()
 
 
@@ -701,6 +759,7 @@ def functional_config(
     model_port: int,
     web_port: int,
     sandbox_port: int,
+    catalog_port: int,
 ) -> str:
     return f"""\
 config:
@@ -733,6 +792,12 @@ llm:
         url: http://127.0.0.1:{web_port}/invoke
         timeout: 3s
         bearerToken: functional-web-token
+    - name: catalog_lookup
+      backend:
+        type: http
+        url: http://127.0.0.1:{catalog_port}/lookup
+        timeout: 3s
+        bearerToken: functional-catalog-token
     - name: code_interpreter
       builtin: codeInterpreter
       backend:
@@ -1375,6 +1440,111 @@ class FunctionalCases:
         )
 
 
+    def tool_search_deferred(self) -> None:
+        with self.state.lock:
+            catalog_before = len(self.state.catalog_requests)
+        client_tools = [
+            {"type": "tool_search"},
+            {
+                "type": "function",
+                "name": "catalog_lookup",
+                "description": "Look up stock for a catalog SKU.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"sku": {"type": "string"}},
+                    "required": ["sku"],
+                    "additionalProperties": False,
+                },
+                "defer_loading": True,
+            },
+        ]
+        status, body = self.request(
+            {
+                "model": "smart",
+                "input": "functional-tool-search catalog stock",
+                "tools": client_tools,
+                "stream": False,
+            }
+        )
+        require(status == 200, "deferred tool search did not return HTTP 200")
+        output = body.get("output")
+        require(
+            isinstance(output, list) and len(output) == 1,
+            "the client saw more than the final answer",
+        )
+        require(output[0].get("type") == "message", "the final output item was not a message")
+        require(
+            output[0]["content"][0]["text"] == "deferred tool answer",
+            "the final answer text changed",
+        )
+        serialized = json.dumps(body, separators=(",", ":"), sort_keys=True)
+        require(
+            "_agentgateway" not in serialized,
+            "a reserved internal name reached the client",
+        )
+        require(
+            body.get("tools") == client_tools,
+            "the client tool declarations did not round-trip verbatim",
+        )
+        usage = body.get("usage")
+        require(
+            isinstance(usage, dict) and usage.get("total_tokens") == 30,
+            "usage was not aggregated across the three model rounds",
+        )
+
+        with self.state.lock:
+            requests = list(self.state.model_requests["tool-search-deferred"])
+            catalog_count = len(self.state.catalog_requests) - catalog_before
+        require(len(requests) == 3, "the deferred tool loop did not take three model rounds")
+
+        first_tools = requests[0].get("tools")
+        require(
+            isinstance(first_tools, list) and len(first_tools) == 1,
+            "the deferred tool was not withheld from the first round",
+        )
+        require(
+            first_tools[0].get("name") == "_agentgateway_tool_search",
+            "the first round did not declare only the search function",
+        )
+        index = first_tools[0].get("description")
+        require(
+            isinstance(index, str) and "catalog_lookup" in index,
+            "the search index did not advertise the deferred tool",
+        )
+
+        second_tools = requests[1].get("tools")
+        require(
+            isinstance(second_tools, list) and len(second_tools) == 2,
+            "the searched declaration was not appended for the second round",
+        )
+        require(
+            second_tools[0].get("name") == "_agentgateway_tool_search"
+            and second_tools[1].get("name") == "catalog_lookup",
+            "the loaded declaration was not appended after the cached prefix",
+        )
+        search_output = next(
+            (
+                item
+                for item in requests[1].get("input", [])
+                if isinstance(item, dict)
+                and item.get("type") == "function_call_output"
+                and item.get("call_id") == "search-call-1"
+            ),
+            None,
+        )
+        require(search_output is not None, "the search result was not replayed to the model")
+        reported = parse_tool_output(search_output)
+        require(reported.get("ok") is True, "the search result was not a success envelope")
+        require(
+            any(
+                isinstance(tool, dict) and tool.get("name") == "catalog_lookup"
+                for tool in reported.get("tools", [])
+            ),
+            "the search result did not report the matching tool",
+        )
+        require(catalog_count == 1, "the loaded tool was not executed exactly once")
+
+
 def stop_process(process: subprocess.Popen[Any]) -> None:
     if process.poll() is not None:
         return
@@ -1404,6 +1574,7 @@ def run_gateway_attempt(
                     servers[0].port,
                     servers[1].port,
                     servers[2].port,
+                    servers[3].port,
                 ),
                 encoding="utf-8",
             )
@@ -1435,6 +1606,7 @@ def run_gateway_attempt(
                         "multi-code-reuse": cases.multi_code_reuse,
                         "active-mode-rejections": cases.active_mode_rejections,
                         "unmanaged-function-passthrough": cases.unmanaged_function_passthrough,
+                        "tool-search-deferred": cases.tool_search_deferred,
                     }
                     for case_name in selected_cases:
                         methods[case_name]()
@@ -1458,7 +1630,7 @@ def run(binary: Path, selected_cases: Sequence[str]) -> None:
     state = MockState()
     servers: List[MockServer] = []
     try:
-        for handler in (ModelHandler, WebSearchHandler, SandboxHandler):
+        for handler in (ModelHandler, WebSearchHandler, SandboxHandler, CatalogHandler):
             server = MockServer(handler, state)
             servers.append(server)
             server.start()
