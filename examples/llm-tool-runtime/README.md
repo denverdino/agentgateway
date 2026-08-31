@@ -330,7 +330,7 @@ root `.env` second. The required names are:
 | `FC_WEATHER_MCP_TOKEN` | Remote MCP application ingress bearer token |
 
 `AGENTGATEWAY_LIVE_MODEL` optionally overrides the default
-`qwen3.6-flash`, and `AGENTGATEWAY_LIVE_UPSTREAM_BASE_URL` optionally overrides
+`qwen3.8-flash`, and `AGENTGATEWAY_LIVE_UPSTREAM_BASE_URL` optionally overrides
 the default LLM compatible-mode `/v1` endpoint. The harness only loads
 these allowlisted names and never prints credentials or backend response
 bodies on failure.
@@ -462,40 +462,62 @@ python3 examples/llm-tool-runtime/test_anthropic_live_functional_test.py
 python3 examples/llm-tool-runtime/test_functional_harness_split.py
 ```
 
-### OpenAI Python SDK streaming case
+### OpenAI and Anthropic Python SDK applications
 
 [`openai_sdk_test.py`](openai_sdk_test.py) connects to an already-running
-AgentGateway through the official OpenAI Python SDK. It requests Web Search and
-Code Interpreter together with `parallel_tool_calls=True` and `stream=True`,
-then verifies the typed event lifecycle, the terminal completed response, and
-that concatenated `response.output_text.delta` values equal the final
-`response.output_text`.
+AgentGateway through the official OpenAI Python SDK and covers all eight cases
+from the OpenAI live application: `web-search`, `code-interpreter`, `combined`,
+`programmatic-server-tools`, `programmatic-mcp-weather`,
+`streaming-tool-runtime`, `remote-mcp-weather`, and
+`tool-search-weather-mcp`. The weather cases require `FC_WEATHER_MCP_URL` and
+`FC_WEATHER_MCP_TOKEN`.
 
-With AgentGateway listening on its normal port 4000, run:
+[`anthropic_sdk_test.py`](anthropic_sdk_test.py) uses the official Anthropic
+Python SDK for the five Messages cases supported by the Anthropic live
+application: `web-search`, `code-interpreter`, `combined`,
+`programmatic-web-search`, and `streaming-tool-runtime`. Remote MCP and Tool
+Search are not included because they are not supported by the Messages harness.
+
+Set up the Python environment and inspect the available cases:
 
 ```sh
-uv run --with openai \
-  python examples/llm-tool-runtime/openai_sdk_test.py
+conda activate agent
+python -m pip install openai anthropic
+python examples/llm-tool-runtime/openai_sdk_test.py --list-cases
+python examples/llm-tool-runtime/anthropic_sdk_test.py --list-cases
 ```
 
-For a gateway using strict client authentication or a different listener/model:
+With AgentGateway already listening on port 4000, run all cases or select cases
+by repeating `--case`:
 
 ```sh
 AGENTGATEWAY_API_KEY="$CLIENT_API_KEY" \
 AGENTGATEWAY_BASE_URL="http://127.0.0.1:4000/v1" \
-AGENTGATEWAY_LIVE_MODEL="qwen3.6-flash" \
-uv run --with openai \
-  python examples/llm-tool-runtime/openai_sdk_test.py
+AGENTGATEWAY_LIVE_MODEL="qwen3.8-flash" \
+python examples/llm-tool-runtime/openai_sdk_test.py \
+  --case web-search \
+  --case streaming-tool-runtime
+
+AGENTGATEWAY_API_KEY="$CLIENT_API_KEY" \
+AGENTGATEWAY_ANTHROPIC_CLIENT_BASE_URL="http://127.0.0.1:4000" \
+AGENTGATEWAY_LIVE_MODEL="claude-haiku-4-5-20251001" \
+python examples/llm-tool-runtime/anthropic_sdk_test.py
 ```
 
-The script intentionally uses `AGENTGATEWAY_API_KEY` for the client-facing
-credential. `OPENAI_API_KEY` remains the upstream provider credential consumed
-by AgentGateway and is not sent by this SDK test.
+The OpenAI SDK base URL includes `/v1`; the Anthropic SDK base URL is the
+gateway root because that SDK appends `/v1/messages`. Both scripts use
+`AGENTGATEWAY_API_KEY` as the client-facing credential. The Anthropic client
+uses `auth_token` so it sends the `Authorization: Bearer` header required by
+the example policy. Upstream `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and provider
+base URL variables remain gateway credentials and are not sent by these SDK
+applications.
 
-Run its offline contract tests without the OpenAI package or cloud access:
+Run the offline SDK contract tests without cloud access:
 
 ```sh
-python3 examples/llm-tool-runtime/test_openai_sdk_test.py
+conda activate agent
+python examples/llm-tool-runtime/test_openai_sdk_test.py
+python examples/llm-tool-runtime/test_anthropic_sdk_test.py
 ```
 
 ## Opt-in live backend tests

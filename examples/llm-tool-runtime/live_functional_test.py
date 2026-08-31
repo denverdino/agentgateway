@@ -42,7 +42,7 @@ CASE_NAMES = (
     "remote-mcp-weather",
     "tool-search-weather-mcp",
 )
-DEFAULT_MODEL = "qwen3.6-flash"
+DEFAULT_MODEL = "qwen3.8-flash"
 DEFAULT_UPSTREAM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 REQUIRED_KEYS = (
     "OPENAI_API_KEY",

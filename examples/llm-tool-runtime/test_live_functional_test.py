@@ -191,7 +191,7 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
 
     def test_case_payloads_expose_both_real_backends(self) -> None:
         cases = self.module.case_payloads(
-            "qwen3.6-flash",
+            "qwen3.8-flash",
             "https://weather.example.test/mcp",
             "weather-mcp-token",
         )
@@ -299,7 +299,7 @@ class LiveFunctionalTestUnitTests(unittest.TestCase):
         self.assertNotIn("tool_choice", tool_search_weather)
         self.assertIn("TOOL_SEARCH_WEATHER_MCP_OK", tool_search_weather["input"])
         for payload in cases.values():
-            self.assertEqual(payload["model"], "qwen3.6-flash")
+            self.assertEqual(payload["model"], "qwen3.8-flash")
         for case_name in (
             "web-search",
             "code-interpreter",
