@@ -1,35 +1,19 @@
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use async_trait::async_trait;
-
+use super::conversation::{ManagedConversation, ModelRoundTrip};
 use super::{
-	CollectedToolCalls, ManagedFinalResponse, PreparedToolRuntime, ProgramOutcome,
-	ProgramReplayEntry, RuntimeBudget, TOOL_SEARCH_FUNCTION, ToolApplicationError,
-	ToolExecutionResult, ToolRuntimeError, ToolRuntimeOutcome, ToolRuntimeSummary, aggregate_usage,
-	build_sandbox_request, execute_batch, finalize_managed_response, fit_replay_entry,
-	has_replay_entry_capacity, parse_sandbox_outcome,
+	CollectedToolCalls, ProgramOutcome, ProgramReplayEntry, RuntimeBudget, TOOL_SEARCH_FUNCTION,
+	ToolApplicationError, ToolExecutionResult, ToolRuntimeError, ToolRuntimeOutcome,
+	build_sandbox_request, execute_batch, fit_replay_entry, has_replay_entry_capacity,
+	parse_sandbox_outcome,
 };
 use crate::http::Response;
-use crate::llm::BufferedResponsesRound;
-use crate::llm::types::responses;
-
-#[async_trait]
-pub(crate) trait ResponsesRoundTrip {
-	async fn execute_round(
-		&mut self,
-		request: &responses::Request,
-		remaining: Duration,
-	) -> Result<ModelRound, ToolRuntimeError>;
-}
-
-pub(crate) enum ModelRound {
-	Success(Box<BufferedResponsesRound>),
+pub(crate) enum ModelRound<R> {
+	Success(Box<R>),
 	UpstreamError(Box<Response>),
 	InfrastructureError(Box<Response>),
 }
-
-pub(crate) type RunResult = ManagedFinalResponse;
 
 pub(crate) enum RunError {
 	Runtime(ToolRuntimeError),
@@ -53,12 +37,16 @@ impl fmt::Debug for RunError {
 	}
 }
 
-pub(crate) async fn run(
-	mut runtime: PreparedToolRuntime,
+pub(crate) async fn run<C, T>(
+	mut conversation: C,
 	mut budget: RuntimeBudget,
-	round_trip: &mut impl ResponsesRoundTrip,
-) -> Result<RunResult, RunError> {
-	let mut accumulated_usage: Option<responses::Usage> = None;
+	round_trip: &mut T,
+) -> Result<C::Final, RunError>
+where
+	C: ManagedConversation,
+	T: ModelRoundTrip<C::Request, C::Round>,
+{
+	budget.set_managed_format(conversation.format());
 	loop {
 		if let Err(error) = budget.start_model_round() {
 			return Err(finish_runtime_error(&mut budget, error));
@@ -67,7 +55,7 @@ pub(crate) async fn run(
 		let remaining = budget.remaining();
 		let round = match tokio::time::timeout(
 			remaining,
-			round_trip.execute_round(&runtime.canonical_request, remaining),
+			round_trip.execute_round(conversation.model_request(), remaining),
 		)
 		.await
 		{
@@ -85,7 +73,6 @@ pub(crate) async fn run(
 			},
 			Ok(Ok(round)) => round,
 		};
-
 		let round = match round {
 			ModelRound::InfrastructureError(response) => {
 				budget.record_model_round(
@@ -111,7 +98,6 @@ pub(crate) async fn run(
 			},
 			ModelRound::Success(round) => *round,
 		};
-
 		if budget.remaining().is_zero() {
 			budget.record_model_round(ToolRuntimeOutcome::Timeout, round_started.elapsed());
 			return Err(finish_runtime_error(
@@ -119,10 +105,8 @@ pub(crate) async fn run(
 				ToolRuntimeError::deadline_exceeded(),
 			));
 		}
-		if let Some(usage) = round.response.usage.as_ref() {
-			aggregate_usage(&mut accumulated_usage, usage);
-		}
-		let collected = match runtime.collect_model_calls(&round.response) {
+		conversation.accumulate_usage(&round);
+		let collected = match conversation.collect_model_calls(&round) {
 			Ok(calls) => calls,
 			Err(error) => {
 				let outcome = error.telemetry_outcome();
@@ -144,41 +128,36 @@ pub(crate) async fn run(
 					ToolRuntimeError::deadline_exceeded(),
 				));
 			}
-			let summary = summary(&runtime, &budget, accumulated_usage);
-			let response = finalize_managed_response(round.response, &summary);
+			let final_response = conversation.finalize(round, &budget);
 			budget.finish_request(ToolRuntimeOutcome::Success);
-			return Ok(ManagedFinalResponse {
-				response,
-				raw_output: round.raw_output,
-				raw_upstream: round.reconstructed_upstream,
-				summary,
-			});
+			return Ok(final_response);
 		}
-
-		let outputs = match Box::pin(execute_collected(&mut runtime, collected, &mut budget)).await {
+		let outputs = match Box::pin(execute_collected(&mut conversation, collected, &mut budget)).await
+		{
 			Ok(outputs) => outputs,
 			Err(error) => return Err(finish_runtime_error(&mut budget, error)),
 		};
-		runtime.append_round_history(round.raw_output, outputs);
+		conversation.append_round_history(round, outputs);
 	}
 }
 
-async fn execute_collected(
-	runtime: &mut PreparedToolRuntime,
+async fn execute_collected<C: ManagedConversation>(
+	conversation: &mut C,
 	collected: CollectedToolCalls,
 	budget: &mut RuntimeBudget,
 ) -> Result<Vec<serde_json::Value>, ToolRuntimeError> {
 	match collected {
-		CollectedToolCalls::Direct(calls) => Box::pin(execute_direct(runtime, calls, budget)).await,
+		CollectedToolCalls::Direct(calls) => {
+			Box::pin(execute_direct(conversation, calls, budget)).await
+		},
 		CollectedToolCalls::Programmatic { call_id, code } => {
-			execute_program(runtime, call_id, code, budget).await
+			execute_program(conversation, call_id, code, budget).await
 		},
 	}
 }
 
-/// Execute a direct batch, splitting out the tool search calls the gateway serves itself.
-async fn execute_direct(
-	runtime: &mut PreparedToolRuntime,
+async fn execute_direct<C: ManagedConversation>(
+	conversation: &mut C,
 	calls: Vec<super::ManagedToolCall>,
 	budget: &mut RuntimeBudget,
 ) -> Result<Vec<serde_json::Value>, ToolRuntimeError> {
@@ -187,9 +166,18 @@ async fn execute_direct(
 		.filter(|call| call.internal_name == TOOL_SEARCH_FUNCTION)
 		.count();
 	if searches == 0 {
-		return execute_batch(&runtime.registry, calls, runtime.parallel, budget).await;
+		let outputs = execute_batch(
+			&conversation.state().registry,
+			calls,
+			conversation.state().parallel,
+			budget,
+		)
+		.await?;
+		return outputs
+			.into_iter()
+			.map(|output| conversation.adapt_batch_output_item(output))
+			.collect();
 	}
-	// A search never reaches a backend, so it escapes `execute_batch`'s accounting.
 	if let Err(error) = budget.reserve_calls(searches) {
 		budget.record_error(&error);
 		return Err(error);
@@ -204,33 +192,38 @@ async fn execute_direct(
 				.and_then(serde_json::Value::as_str)
 				.ok_or_else(ToolRuntimeError::internal)?
 				.to_owned();
-			let result = runtime.execute_tool_search(&query)?;
-			outputs.push(tool_output_item(
-				call.call_id,
+			let result = conversation.execute_tool_search(&query)?;
+			outputs.push(conversation.tool_output_item(
+				&call.call_id,
 				result,
 				budget.max_output_bytes(),
 			)?);
 		} else {
-			// Reserve the slot so the merged transcript keeps the model's original call order.
 			outputs.push(serde_json::Value::Null);
 			backed.push((outputs.len() - 1, call));
 		}
 	}
 	if !backed.is_empty() {
 		let (slots, calls): (Vec<usize>, Vec<super::ManagedToolCall>) = backed.into_iter().unzip();
-		let executed = execute_batch(&runtime.registry, calls, runtime.parallel, budget).await?;
+		let executed = execute_batch(
+			&conversation.state().registry,
+			calls,
+			conversation.state().parallel,
+			budget,
+		)
+		.await?;
 		if executed.len() != slots.len() {
 			return Err(ToolRuntimeError::internal());
 		}
 		for (slot, output) in slots.into_iter().zip(executed) {
-			outputs[slot] = output;
+			outputs[slot] = conversation.adapt_batch_output_item(output)?;
 		}
 	}
 	Ok(outputs)
 }
 
-async fn execute_program(
-	runtime: &PreparedToolRuntime,
+async fn execute_program<C: ManagedConversation>(
+	conversation: &C,
 	call_id: agent_core::prelude::Strng,
 	code: String,
 	budget: &mut RuntimeBudget,
@@ -262,6 +255,7 @@ async fn execute_program(
 				.to_owned(),
 			ToolExecutionResult::ApplicationError(error) => {
 				return synthetic_program_output(
+					conversation,
 					call_id,
 					ToolExecutionResult::ApplicationError(error),
 					budget.max_output_bytes(),
@@ -288,6 +282,7 @@ async fn execute_program(
 				};
 				if !has_replay_entry_capacity(&replay, &replay_entry, budget.max_output_bytes()) {
 					return synthetic_program_output(
+						conversation,
 						call_id,
 						ToolExecutionResult::ApplicationError(ToolApplicationError::new(
 							"program_replay_limit",
@@ -299,14 +294,15 @@ async fn execute_program(
 						budget.max_output_bytes(),
 					);
 				}
-				let call = runtime.resolve_programmatic_call(
+				let call = conversation.state().resolve_programmatic_call(
 					&program_execution_id,
 					pending.sequence,
 					pending.public_name.as_str(),
 					pending.arguments.clone(),
 				)?;
 				let tool_started = Instant::now();
-				let mut outputs = execute_batch(&runtime.registry, vec![call], false, budget).await?;
+				let mut outputs =
+					execute_batch(&conversation.state().registry, vec![call], false, budget).await?;
 				tracing::debug!(
 					sequence = pending.sequence,
 					duration_ms = tool_started.elapsed().as_millis(),
@@ -332,6 +328,7 @@ async fn execute_program(
 					"programmatic tool call completed"
 				);
 				return synthetic_program_output(
+					conversation,
 					call_id,
 					ToolExecutionResult::function(serde_json::json!({"result": value})),
 					budget.max_output_bytes(),
@@ -347,6 +344,7 @@ async fn execute_program(
 				message,
 			} => {
 				return synthetic_program_output(
+					conversation,
 					call_id,
 					ToolExecutionResult::ApplicationError(ToolApplicationError::new(
 						error_type, message, false, "", "",
@@ -358,44 +356,17 @@ async fn execute_program(
 	}
 }
 
-fn synthetic_program_output(
+fn synthetic_program_output<C: ManagedConversation>(
+	conversation: &C,
 	call_id: agent_core::prelude::Strng,
 	result: ToolExecutionResult,
 	max_output_bytes: usize,
 ) -> Result<Vec<serde_json::Value>, ToolRuntimeError> {
-	Ok(vec![tool_output_item(call_id, result, max_output_bytes)?])
-}
-
-/// Build the `function_call_output` item for a tool the gateway resolved without a backend round trip.
-fn tool_output_item(
-	call_id: agent_core::prelude::Strng,
-	result: ToolExecutionResult,
-	max_output_bytes: usize,
-) -> Result<serde_json::Value, ToolRuntimeError> {
-	let output = result.into_model_output(max_output_bytes)?;
-	let output = serde_json::to_string(&output).map_err(|_| ToolRuntimeError::internal())?;
-	Ok(serde_json::json!({
-		"type": "function_call_output",
-		"call_id": call_id,
-		"output": output,
-	}))
-}
-
-fn summary(
-	runtime: &PreparedToolRuntime,
-	_budget: &RuntimeBudget,
-	usage: Option<responses::Usage>,
-) -> ToolRuntimeSummary {
-	ToolRuntimeSummary {
-		usage,
-		#[cfg(test)]
-		rounds: _budget.rounds(),
-		#[cfg(test)]
-		tool_calls: _budget.tool_calls(),
-		client_streaming: runtime.client_streaming,
-		include_obfuscation: runtime.include_obfuscation,
-		client_tools: runtime.client_tools.as_deref().cloned(),
-	}
+	Ok(vec![conversation.tool_output_item(
+		&call_id,
+		result,
+		max_output_bytes,
+	)?])
 }
 
 fn finish_runtime_error(budget: &mut RuntimeBudget, error: ToolRuntimeError) -> RunError {

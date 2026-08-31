@@ -258,37 +258,46 @@ request ID.
 
 ## Hermetic release-binary functional tests
 
-The standard-library harness starts the real release executable, three local
-loopback mocks (model, Web Search, and E2B control/data planes), and a temporary static
-config. Every assertion travels through public `/v1/responses`; the gateway is
-never simulated in-process. Temporary files and children are cleaned up on
-success, failure, and interruption, and diagnostics never dump credentials,
-submitted code, or tool output. Held reservations make the gateway/readiness
-ports distinct before launch; bounded retries cover the remaining release-and-
-bind race. A missing and incorrect client key must return 401 without reaching
-the model, then an authenticated identity probe confirms the selected child and
-temporary config. Every mock enforces its fixed path, bearer auth, exact JSON
-content type, and selected upstream model. The overlap case uses a bounded
-two-backend barrier, so both backends must observe each other before completing.
+The standard-library harnesses start the real release executable with local
+loopback mocks and temporary static configuration. Every assertion travels
+through the provider's public endpoint; the gateway is never simulated
+in-process. Temporary files and children are cleaned up on success, failure,
+and interruption, and diagnostics never dump credentials, submitted code, or
+tool output.
+
+The OpenAI Responses harness uses `/v1/responses` and owns these cases:
+`dual-tool-overlap`, `programmatic-server-tools`, `web-search-single`,
+`streaming-tool-runtime`, `multi-code-reuse`, `active-mode-rejections`,
+`unmanaged-function-passthrough`, and `tool-search-deferred`.
+
+The Anthropic Messages harness uses `/v1/messages` and owns the
+`messages-programmatic` case, including the native Anthropic mock model and its
+programmatic-tool assertions.
 
 ```sh
 cargo build --release -p agentgateway-app
 python3 examples/llm-tool-runtime/functional_test.py \
   --binary ./target/release/agentgateway
+python3 examples/llm-tool-runtime/anthropic_functional_test.py \
+  --binary ./target/release/agentgateway
 ```
 
-List or select cases individually:
+List or select cases independently:
 
 ```sh
 python3 examples/llm-tool-runtime/functional_test.py --list-cases
 python3 examples/llm-tool-runtime/functional_test.py \
   --binary ./target/release/agentgateway \
   --case dual-tool-overlap
+python3 examples/llm-tool-runtime/anthropic_functional_test.py --list-cases
+python3 examples/llm-tool-runtime/anthropic_functional_test.py \
+  --binary ./target/release/agentgateway \
+  --case messages-programmatic
 ```
 
 See [`FUNCTIONAL_TEST_CASES.md`](FUNCTIONAL_TEST_CASES.md) for the exact
 assertions and the additional Rust, Python, and opt-in live coverage. These are
-reproducible hermetic local/release checks and require no cloud credential;
+reproducible hermetic local/release checks and require no cloud credentials;
 this example does not add or claim repository CI workflow wiring.
 
 ## Real-backend functional test application
@@ -401,11 +410,56 @@ python3 examples/llm-tool-runtime/live_functional_test.py \
   --show-output
 ```
 
-Run the
-hermetic harness unit tests without cloud access using:
+Run the OpenAI live harness unit tests without cloud access using:
 
 ```sh
 python3 examples/llm-tool-runtime/test_live_functional_test.py
+```
+
+### Anthropic Messages live functional application
+
+[`anthropic_live_functional_test.py`](anthropic_live_functional_test.py) is a
+separate opt-in live application for native Anthropic `/v1/messages` requests.
+It uses the same isolated-process, temporary-config, strict client-auth,
+allowlisted `.env`, bounded-retry, metrics, and sanitized-diagnostic practices
+as the OpenAI-compatible live application. It does not run Remote MCP or Tool
+Search cases because those are not supported by this Messages harness.
+
+It requires `ANTHROPIC_API_KEY`, `FC_WEB_SEARCH_URL`,
+`FC_WEB_SEARCH_TOKEN`, `E2B_API_KEY`, `E2B_API_URL`, and `E2B_DOMAIN`.
+Process environment values take precedence over the repository `.env`. The
+default model is `claude-haiku-4-5-20251001`; override it with
+`AGENTGATEWAY_LIVE_MODEL`. `ANTHROPIC_BASE_URL` follows Anthropic SDK semantics,
+so the harness appends `/v1` when it is absent (for example, a compatible
+provider root ending in `/apps/anthropic`). `AGENTGATEWAY_ANTHROPIC_BASE_URL`
+is the explicit AgentGateway path prefix and is used unchanged. Only allowlisted
+names are loaded, and secrets or backend response bodies are not printed.
+
+The supported cases are `web-search`, `code-interpreter`, `combined`,
+`programmatic-web-search`, and `streaming-tool-runtime`. They require final
+markers and the relevant successful backend metrics. The programmatic case
+declares `code_execution_20260120` with programmatic-only
+`web_search_20260209`, proves both a nested HTTP Web Search call and a successful
+Sandbox execution, and rejects reserved `_agentgateway_` names in structured
+client-visible fields. The streaming case validates the Anthropic Messages SSE
+lifecycle.
+
+```sh
+python3 examples/llm-tool-runtime/anthropic_live_functional_test.py --list-cases
+python3 examples/llm-tool-runtime/anthropic_live_functional_test.py \
+  --binary ./target/release/agentgateway
+python3 examples/llm-tool-runtime/anthropic_live_functional_test.py \
+  --binary ./target/release/agentgateway \
+  --case programmatic-web-search \
+  --show-output
+```
+
+These commands use real credentials and real cloud backends; they are never run
+by the offline test suite. Test the application contracts without cloud access:
+
+```sh
+python3 examples/llm-tool-runtime/test_anthropic_live_functional_test.py
+python3 examples/llm-tool-runtime/test_functional_harness_split.py
 ```
 
 ### OpenAI Python SDK streaming case

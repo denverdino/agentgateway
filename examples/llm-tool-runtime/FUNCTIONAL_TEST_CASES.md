@@ -1,13 +1,13 @@
-# Responses tool runtime functional test cases
+# Tool runtime functional test cases
 
-The release-binary harness is
-[`functional_test.py`](functional_test.py). It launches the requested
-`agentgateway` executable with ephemeral loopback ports and a temporary config,
-waits for readiness, and sends requests only through public
-`/v1/responses`. Its model, Web Search, Sandbox, and managed HTTP tool endpoints
-are local mocks; no cloud credential is required.
+The OpenAI Responses release-binary harness is
+[`functional_test.py`](functional_test.py), and the Anthropic Messages harness
+is [`anthropic_functional_test.py`](anthropic_functional_test.py). Each launches
+the requested `agentgateway` executable with ephemeral loopback ports, provider-
+specific model mocks, and temporary configuration. Requests use only the public
+`/v1/responses` or `/v1/messages` endpoint. No cloud credential is required.
 
-Run all harness cases or select repeatable cases by name:
+Run all cases or select repeatable cases by name:
 
 ```sh
 python3 examples/llm-tool-runtime/functional_test.py \
@@ -16,18 +16,29 @@ python3 examples/llm-tool-runtime/functional_test.py \
   --binary ./target/release/agentgateway \
   --case web-search-single \
   --case unmanaged-function-passthrough
+
+python3 examples/llm-tool-runtime/anthropic_functional_test.py \
+  --binary ./target/release/agentgateway \
+  --case messages-programmatic
 ```
+
+The OpenAI harness cases are `dual-tool-overlap`,
+`programmatic-server-tools`, `web-search-single`, `streaming-tool-runtime`,
+`multi-code-reuse`, `active-mode-rejections`,
+`unmanaged-function-passthrough`, and `tool-search-deferred`. The Anthropic
+harness owns only `messages-programmatic`.
 
 ## Coverage matrix
 
 | Scenario | Release harness | Other automation | Exact expected assertions |
 |---|---|---|---|
-| Strict listener API key | Startup identity check before every selected case | Config validation | Missing and incorrect bearer keys return HTTP 401 and make zero model requests. The configured client key is accepted, reaches the exact local model endpoint as `mock-model`, and returns the fixed identity response. |
+| Strict listener API key | Startup identity check in each hermetic harness | Config validation | Missing and incorrect bearer keys return HTTP 401 and make zero model requests. The configured client key is accepted, reaches the selected local provider endpoint, and returns the fixed identity response for `mock-model` or `mock-claude`. |
 | Web Search single call | `web-search-single` | Live smoke is opt-in | HTTP 200 final round; exactly two model rounds, one Web Search call, zero E2B lifecycle calls; aggregate usage `8/5/13`; complete canonical history; stable `web-only-1` call ID. |
 | Same-Response multi-code reuse | `multi-code-reuse` | Direct E2B Rust protocol tests | HTTP 200 final round; exactly two model rounds; two stable call IDs in request order; exactly one Sandbox create/kill pair, two sequential context lifecycles, and no Web Search; canonical outputs remain `set\n` then `isolated\n`; aggregate usage `13/7/20`. OS filesystem/process state remains shared. |
 | Web Search and Code overlap | `dual-tool-overlap` | Hermetic Rust acceptance | Round one emits both reserved calls. Web Search and E2B create wait at a bounded two-party barrier and must observe each other before either can complete. Exactly one Web Search call and one E2B Sandbox lifecycle run; canonical output order follows model order rather than completion order. |
 | Multi-round usage and final-only response | `dual-tool-overlap` | Hermetic Rust acceptance | Exactly two model rounds; public model is `mock-model`; aggregate usage is `22/10/32`; only `msg_dual_final` is returned. Intermediate message, call IDs, Web Search snippet, code output, and function outputs do not leak into the client body. |
 | Python Programmatic Tool Calling replay | `programmatic-server-tools` | Protocol, E2B, budget, and runner Rust tests | The model emits one `{code}` synthetic call. AgentGateway performs two pending replays, executes one Web Search and one nested Code Interpreter call sequentially, performs a completed replay, and returns one normalized synthetic output. Four E2B lifecycles occur without charging Sandbox runs to `maxToolCalls`; only the two nested tools consume call budget. |
+| Anthropic Messages programmatic calling | `messages-programmatic` in `anthropic_functional_test.py` | Messages mapper, runner, and proxy Rust tests | Public `/v1/messages` returns HTTP 200 and only the final Anthropic `message`; no `tool_use`, `server_tool_use`, or `_agentgateway_` name reaches the client; input usage is summed across multiple rounds and exactly one managed HTTP tool call runs. The mock pins `POST /v1/messages`, `x-api-key: functional-model-token`, model `mock-claude`, and non-streaming internal rounds. |
 | Managed streaming final response | `streaming-tool-runtime` (also live) | `responses_managed_tool_runtime_streams_only_the_final_answer` | HTTP 200 `text/event-stream`; internal model requests use `stream: false`; SSE contains the lifecycle and final text delta but no reserved tool name or intermediate result; `response.completed` carries aggregate usage; Web Search executes once. |
 | Live Beijing weather over remote MCP | `remote-mcp-weather` in the opt-in live harness | Remote MCP Rust protocol tests and `weather-mcp-fc` Node tests | HTTP 200 completed response; final output contains `WEATHER_MCP_BEIJING_OK`; the request exposes only `get_forecast` and `get_current_weather` from the authenticated FC MCP URL; local metrics prove a successful `remote_mcp` execution. |
 | Live three-day weather through a Python program | `programmatic-mcp-weather` in the opt-in live harness | Programmatic MCP catalog and replay Rust tests | The MCP declaration is programmatic-only and exposes `weather.get_forecast` as the public Python name. The generated Python requests `days=3` and selects the highest daily maximum plus the lowest daily minimum, choosing the earliest date for ties; the final answer contains both extreme days and `PROGRAMMATIC_MCP_WEATHER_3DAY_OK`; local metrics prove one successful `remote_mcp` call. |
@@ -81,21 +92,37 @@ content-bearing fields.
 
 ## Live/manual boundary
 
-The documented release harness, Rust acceptance/unit tests, and Web Search
+The documented release harnesses, Rust acceptance/unit tests, and Web Search
 Function suite are reproducible hermetic checks; this example does not wire
-them into repository CI. [`live_functional_test.py`](live_functional_test.py)
-is the opt-in end-to-end application for a real LLM model, FC Web Search
-Function, E2B-compatible Sandbox, and the deployed FC WeatherAPI MCP server. It
-starts a release AgentGateway with a temporary named-gateway config and verifies
+them into repository CI.
+
+[`live_functional_test.py`](live_functional_test.py) is the opt-in OpenAI-
+compatible Responses application for a real LLM model, FC Web Search Function,
+E2B-compatible Sandbox, and deployed FC WeatherAPI MCP server. It verifies
 successful tool-call metric deltas for `web-search`, `code-interpreter`,
 `combined`, `programmatic-server-tools`, `programmatic-mcp-weather`,
-`streaming-tool-runtime`, and `remote-mcp-weather`. The streaming
-case validates final-only Responses SSE output and a successful Web Search
-invocation; the MCP case queries Beijing weather through an allowlisted remote
-tool and validates a successful `remote_mcp` metric. The programmatic MCP case
-uses the Free-plan three-day forecast window through `tools.call`. When invoked
-with `--show-output`, it prints all model-generated Python programs in execution
-order before the final forecast. It never modifies the operator's system config.
+`streaming-tool-runtime`, `remote-mcp-weather`, and
+`tool-search-weather-mcp`.
+
+[`anthropic_live_functional_test.py`](anthropic_live_functional_test.py) is the
+independent opt-in native Anthropic Messages application. It requires
+`ANTHROPIC_API_KEY`, `FC_WEB_SEARCH_URL`, `FC_WEB_SEARCH_TOKEN`, `E2B_API_KEY`,
+`E2B_API_URL`, and `E2B_DOMAIN`, loading only those and documented model/base-
+URL overrides from the environment or repository `.env`. Its default model is
+`claude-haiku-4-5-20251001`. Its cases are `web-search`, `code-interpreter`,
+`combined`, `programmatic-web-search`, and `streaming-tool-runtime`; Remote MCP
+and Tool Search are explicit Messages non-goals. Every case checks a final
+marker and the relevant backend metric deltas. Programmatic Web Search requires
+`code_execution_20260120` with programmatic-only `web_search_20260209`, a
+successful nested HTTP Web Search call, a successful Sandbox execute operation,
+and no reserved name in structured response fields. Streaming validates the
+Anthropic SSE `message_start`/content delta/`message_stop` lifecycle.
+
+Both live applications use temporary named-gateway configuration, strict
+client authentication, bounded startup retries, and content-free diagnostics.
+They require real cloud credentials and are not part of offline verification.
+Use `test_live_functional_test.py` and
+`test_anthropic_live_functional_test.py` for cloud-free contract tests.
 
 The two ignored Rust live tests are automated backend smokes only when
 `AGENTGATEWAY_LIVE_TOOLS=1` and the Web Search plus three E2B variables are present.

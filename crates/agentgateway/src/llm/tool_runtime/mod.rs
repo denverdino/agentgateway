@@ -2,12 +2,15 @@
 
 mod backend;
 mod config;
+mod conversation;
 mod e2b;
 mod http_backend;
 mod mapper;
+pub(crate) mod messages;
 mod program;
 mod registry;
 mod remote_mcp;
+mod responses_conversation;
 pub(crate) mod runner;
 mod schema;
 mod telemetry;
@@ -15,7 +18,7 @@ mod transport;
 mod validation;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -32,6 +35,7 @@ pub(crate) use backend::{
 pub use config::{
 	BuiltinTool, ManagedToolConfig, RuntimeLimits, ToolBackendConfig, ToolRuntimeConfig,
 };
+pub(crate) use conversation::{ManagedToolState, ModelRoundTrip};
 pub(crate) use e2b::E2bSandboxBackend;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 pub(crate) use http_backend::HttpToolBackend;
@@ -44,6 +48,7 @@ pub(crate) use program::{
 use rand::RngExt;
 pub(crate) use registry::ToolRegistry;
 pub(crate) use remote_mcp::{RemoteMcpBackend, RemoteMcpTool};
+pub(crate) use runner::ModelRound;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 pub(crate) use telemetry::ToolExecutionRecord;
@@ -51,10 +56,10 @@ pub use telemetry::{
 	SandboxOperation, SandboxOperationDurationLabels, SandboxOperationLabels,
 	SandboxOperationOutcome, ToolBackendLabel, ToolCallDurationLabels, ToolCallLabels,
 	ToolExecutionOutcome, ToolLabels, ToolRuntimeLimit, ToolRuntimeLimitLabels, ToolRuntimeOutcome,
-	ToolRuntimeOutcomeLabels,
+	ToolRuntimeOutcomeLabels, ToolRuntimeRequestLabels,
 };
 
-use self::telemetry::ToolRuntimeTelemetry;
+use self::telemetry::{ManagedFormat, ToolRuntimeTelemetry};
 use self::transport::truncate_utf8_bytes;
 use crate::http::Response;
 use crate::proxy::httpproxy::PolicyClient;
@@ -335,17 +340,13 @@ impl RuntimeDeadline {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedToolRuntime {
-	pub(crate) registry: Arc<ToolRegistry>,
+	pub(crate) state: ManagedToolState,
 	pub(crate) canonical_request: responses::Request,
-	programmatic_requested: bool,
-	programmatic_tools: Arc<HashMap<Strng, ProgrammaticToolSpec>>,
-	programmatic_catalog_bytes: usize,
-	pub(crate) parallel: bool,
 	pub(crate) client_streaming: bool,
 	pub(crate) include_obfuscation: bool,
 	/// Boxed for the same reason as `tool_search`: this is only read when finalizing the response.
 	pub(crate) client_tools: Option<Box<Value>>,
-	pub(crate) deadline: RuntimeDeadline,
+	pub(crate) accumulated_usage: Box<Option<responses::Usage>>,
 	pub(crate) pending_remote_mcp: Vec<RemoteMcpServer>,
 	/// Present exactly when the request declared `tool_search`. Boxed to keep `PreparedToolRuntime`
 	/// small: it lives by value inside the proxy's backend-call future, which is size-asserted.
@@ -446,7 +447,7 @@ impl PreparedToolRuntime {
 			.and_then(Value::as_array)
 			.cloned()
 			.unwrap_or_default();
-		let mut registry = (*self.registry).clone();
+		let mut registry = (*self.state.registry).clone();
 		for (tool_index, tool) in tools.into_iter().enumerate() {
 			let internal_name = Strng::from(format!(
 				"{REMOTE_MCP_FUNCTION_PREFIX}{server_index}_{tool_index}"
@@ -506,25 +507,13 @@ impl PreparedToolRuntime {
 				}
 			}
 			if allowed_callers.programmatic {
-				if self.programmatic_tools.contains_key(public_name.as_str()) {
-					return Err(ToolRuntimeError::invalid_request(
-						"duplicate programmatic tool name",
-					));
-				}
-				let spec = ProgrammaticToolSpec {
+				self.state.insert_programmatic_tool(ProgrammaticToolSpec {
 					public_name: public_name.clone(),
 					internal_name: internal_name.clone(),
 					description: description.clone(),
 					input_schema: tool.input_schema.clone(),
 					output_schema: tool.output_schema.clone(),
-				};
-				let next_size = checked_programmatic_catalog_add(
-					self.programmatic_catalog_bytes,
-					!self.programmatic_tools.is_empty(),
-					&spec,
-				)?;
-				Arc::make_mut(&mut self.programmatic_tools).insert(public_name.clone(), spec);
-				self.programmatic_catalog_bytes = next_size;
+				})?;
 			}
 			if forced_mcp_tool && allowed_callers.direct {
 				self.canonical_request.replace_rest_field(
@@ -543,7 +532,7 @@ impl PreparedToolRuntime {
 		self
 			.canonical_request
 			.replace_rest_field("tools", Value::Array(declarations));
-		self.registry = Arc::new(registry);
+		self.state.registry = Arc::new(registry);
 		Ok(())
 	}
 
@@ -679,13 +668,13 @@ impl PreparedToolRuntime {
 			.unwrap_or_default();
 		declarations
 			.retain(|tool| tool.get("name").and_then(Value::as_str) != Some(PROGRAMMATIC_FUNCTION));
-		if !self.programmatic_requested {
+		if !self.state.programmatic_requested() {
 			self
 				.canonical_request
 				.replace_rest_field("tools", Value::Array(declarations));
 			return Ok(());
 		}
-		if self.programmatic_tools.is_empty() {
+		if !self.state.has_programmatic_tools() {
 			if self.pending_remote_mcp.is_empty() {
 				return Err(ToolRuntimeError::invalid_request(
 					"programmatic_tool_calling requires at least one programmatic tool",
@@ -697,18 +686,12 @@ impl PreparedToolRuntime {
 			return Ok(());
 		}
 
-		let mut catalog = self.programmatic_tools.values().collect::<Vec<_>>();
-		catalog.sort_by(|left, right| left.public_name.cmp(&right.public_name));
-		let catalog = catalog
-			.into_iter()
-			.map(programmatic_catalog_entry)
-			.collect::<Vec<_>>();
-		let catalog = serde_json::to_string(&catalog).map_err(|_| ToolRuntimeError::internal())?;
-		if catalog.len() > PROGRAMMATIC_MAX_CATALOG_BYTES {
-			return Err(ToolRuntimeError::invalid_request(
-				"programmatic tool catalog exceeds the 2097152-byte limit",
-			));
-		}
+		let Some(catalog) = self.state.programmatic_catalog_json()? else {
+			self
+				.canonical_request
+				.replace_rest_field("tools", Value::Array(declarations));
+			return Ok(());
+		};
 		declarations.push(json!({
 			"type": "function",
 			"name": PROGRAMMATIC_FUNCTION,
@@ -727,44 +710,6 @@ impl PreparedToolRuntime {
 			.canonical_request
 			.replace_rest_field("tools", Value::Array(declarations));
 		Ok(())
-	}
-
-	pub(crate) fn resolve_programmatic_call(
-		&self,
-		execution_id: &str,
-		sequence: usize,
-		public_name: &str,
-		arguments: Value,
-	) -> Result<ManagedToolCall, ToolRuntimeError> {
-		let spec = self.programmatic_tools.get(public_name).ok_or_else(|| {
-			ToolRuntimeError::invalid_request("programmatic call used an undeclared tool")
-		})?;
-		let registered = self
-			.registry
-			.by_internal_name
-			.get(spec.internal_name.as_str())
-			.ok_or_else(|| {
-				ToolRuntimeError::invalid_configuration("programmatic tool is not registered")
-			})?;
-		if !registered
-			.argument_schema
-			.as_ref()
-			.is_some_and(|schema| schema.is_valid(&arguments))
-		{
-			return Err(ToolRuntimeError::invalid_request(
-				"programmatic tool arguments do not match declared schema",
-			));
-		}
-		Ok(ManagedToolCall {
-			public_name: registered.public_name.clone(),
-			internal_name: spec.internal_name.clone(),
-			call_id: Strng::from(format!("programmatic_{execution_id}_{sequence}")),
-			arguments,
-			trusted_options: registered
-				.trusted_options
-				.clone()
-				.unwrap_or_else(|| Value::Object(Default::default())),
-		})
 	}
 
 	/// Authorize and parse the function calls emitted by one model Response.
@@ -818,7 +763,7 @@ impl PreparedToolRuntime {
 				));
 			}
 			if call.name == PROGRAMMATIC_FUNCTION {
-				if !self.programmatic_requested || !declared.contains(PROGRAMMATIC_FUNCTION) {
+				if !self.state.programmatic_requested() || !declared.contains(PROGRAMMATIC_FUNCTION) {
 					return Err(ToolRuntimeError::invalid_request(
 						"model generated an undeclared programmatic tool call",
 					));
@@ -852,7 +797,7 @@ impl PreparedToolRuntime {
 			if call.name == TOOL_SEARCH_FUNCTION {
 				let arguments = parse_arguments(
 					call.arguments.as_bytes(),
-					self.registry.limits.max_arguments_bytes,
+					self.state.registry.limits.max_arguments_bytes,
 				)?;
 				if !arguments
 					.get("query")
@@ -872,6 +817,7 @@ impl PreparedToolRuntime {
 				continue;
 			}
 			let registered = self
+				.state
 				.registry
 				.by_internal_name
 				.get(call.name.as_str())
@@ -883,7 +829,7 @@ impl PreparedToolRuntime {
 				})?;
 			let arguments = parse_arguments(
 				call.arguments.as_bytes(),
-				self.registry.limits.max_arguments_bytes,
+				self.state.registry.limits.max_arguments_bytes,
 			)?;
 			let argument_schema = registered.argument_schema.as_ref().ok_or_else(|| {
 				ToolRuntimeError::invalid_configuration("managed function argument schema was not compiled")
@@ -907,7 +853,7 @@ impl PreparedToolRuntime {
 		if let Some((call_id, arguments)) = programmatic {
 			let arguments = parse_arguments(
 				arguments.as_bytes(),
-				self.registry.limits.max_arguments_bytes,
+				self.state.registry.limits.max_arguments_bytes,
 			)?;
 			let object = arguments.as_object().ok_or_else(|| {
 				ToolRuntimeError::invalid_request("programmatic call arguments must be an object")
@@ -930,7 +876,7 @@ impl PreparedToolRuntime {
 				code: code.to_owned(),
 			});
 		}
-		validate_sandbox_contract(&self.registry, &calls, self.parallel)?;
+		validate_sandbox_contract(&self.state.registry, &calls, self.state.parallel)?;
 		Ok(CollectedToolCalls::Direct(calls))
 	}
 }
@@ -1157,6 +1103,39 @@ impl ToolRuntimeError {
 						"type": "invalid_request_error",
 						"message": self.message,
 						"code": "managed_tool_request_invalid",
+					}
+				}),
+			),
+		};
+		let body = serde_json::to_vec(&body).expect("tool runtime error response serializes");
+		::http::Response::builder()
+			.status(status)
+			.header(::http::header::CONTENT_TYPE, "application/json")
+			.body(crate::http::Body::from(body))
+			.expect("tool runtime error response builds")
+	}
+
+	#[allow(dead_code)]
+	pub(crate) fn into_anthropic_response(self) -> crate::http::Response {
+		let (status, body) = match (self.deadline_exceeded, self.infrastructure) {
+			(true, _) => (
+				::http::StatusCode::GATEWAY_TIMEOUT,
+				ToolInfrastructureError::Timeout.to_anthropic_error(),
+			),
+			(false, Some(infrastructure)) => (
+				::http::StatusCode::BAD_GATEWAY,
+				infrastructure.to_anthropic_error(),
+			),
+			(false, None) => (
+				::http::StatusCode::BAD_REQUEST,
+				json!({
+					"type": "error",
+					"error": {
+						"type": "invalid_request_error",
+						"message": self
+							.message
+							.strip_prefix("invalid managed tool request: ")
+							.unwrap_or(&self.message)
 					}
 				}),
 			),
@@ -1395,6 +1374,10 @@ impl RuntimeBudget {
 
 	pub(crate) fn set_request_id(&mut self, request_id: Option<Strng>) {
 		self.request_id = request_id;
+	}
+
+	pub(crate) fn set_managed_format(&mut self, format: ManagedFormat) {
+		self.telemetry.set_managed_format(format);
 	}
 
 	pub(crate) fn remaining(&self) -> std::time::Duration {

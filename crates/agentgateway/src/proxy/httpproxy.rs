@@ -2363,13 +2363,57 @@ struct PinnedResponsesRoundTrip<'a, 'log> {
 	log: &'a mut Option<&'log mut RequestLog>,
 }
 
+impl PinnedResponsesRoundTrip<'_, '_> {
+	async fn build_round_request(
+		&mut self,
+		body: Vec<u8>,
+	) -> Result<Request, llm::tool_runtime::ToolRuntimeError> {
+		let mut request = self
+			.template
+			.build(body)
+			.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		if let Some(auth) = self.backend_call.backend_policies.backend_auth.as_ref() {
+			auth::apply_backend_auth(self.backend_info, auth, &mut request)
+				.await
+				.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		}
+		self
+			.llm
+			.provider
+			.setup_request(
+				&mut request,
+				self.upstream_route_type,
+				Some(self.llm_request),
+				self.llm.path_override.as_deref(),
+				self.llm.path_prefix.as_deref(),
+				self.llm.host_override.is_some(),
+			)
+			.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		self.llm.provider.strip_browser_cors_headers(&mut request);
+		apply_auto_hostname(&mut request, &self.backend_call.target)
+			.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		auth::apply_late_backend_auth(
+			self.backend_call.backend_policies.backend_auth.as_ref(),
+			&mut request,
+		)
+		.await
+		.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		Ok(request)
+	}
+}
+
 #[async_trait::async_trait]
-impl llm::tool_runtime::runner::ResponsesRoundTrip for PinnedResponsesRoundTrip<'_, '_> {
+impl llm::tool_runtime::ModelRoundTrip<llm::types::responses::Request, llm::BufferedResponsesRound>
+	for PinnedResponsesRoundTrip<'_, '_>
+{
 	async fn execute_round(
 		&mut self,
 		canonical_request: &llm::types::responses::Request,
 		_remaining: Duration,
-	) -> Result<llm::tool_runtime::runner::ModelRound, llm::tool_runtime::ToolRuntimeError> {
+	) -> Result<
+		llm::tool_runtime::runner::ModelRound<llm::BufferedResponsesRound>,
+		llm::tool_runtime::ToolRuntimeError,
+	> {
 		let request = if let Some(request) = self.first_request.take() {
 			request
 		} else {
@@ -2385,37 +2429,7 @@ impl llm::tool_runtime::runner::ResponsesRoundTrip for PinnedResponsesRoundTrip<
 					self.llm_request,
 				)
 				.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
-			let mut request = self
-				.template
-				.build(body)
-				.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
-			if let Some(auth) = self.backend_call.backend_policies.backend_auth.as_ref() {
-				auth::apply_backend_auth(self.backend_info, auth, &mut request)
-					.await
-					.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
-			}
-			self
-				.llm
-				.provider
-				.setup_request(
-					&mut request,
-					self.upstream_route_type,
-					Some(self.llm_request),
-					self.llm.path_override.as_deref(),
-					self.llm.path_prefix.as_deref(),
-					self.llm.host_override.is_some(),
-				)
-				.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
-			self.llm.provider.strip_browser_cors_headers(&mut request);
-			apply_auto_hostname(&mut request, &self.backend_call.target)
-				.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
-			auth::apply_late_backend_auth(
-				self.backend_call.backend_policies.backend_auth.as_ref(),
-				&mut request,
-			)
-			.await
-			.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
-			request
+			self.build_round_request(body).await?
 		};
 
 		let response = match call_pinned_upstream(
@@ -2458,6 +2472,130 @@ impl llm::tool_runtime::runner::ResponsesRoundTrip for PinnedResponsesRoundTrip<
 	}
 }
 
+struct PinnedMessagesRoundTrip<'a, 'log> {
+	inputs: &'a Arc<ProxyInputs>,
+	backend_info: &'a auth::BackendInfo,
+	backend_call: &'a BackendCall,
+	llm_request_policies: &'a store::LLMRequestPolicies,
+	llm: &'a llm::NamedAIProvider,
+	template: &'a ResponsesRoundRequestTemplate,
+	upstream_route_type: RouteType,
+	llm_request: &'a mut LLMRequest,
+	first_request: Option<Request>,
+	connection: &'a client::ConnectionConfig,
+	outbound_labels: &'a OutboundCallLabels,
+	log: &'a mut Option<&'log mut RequestLog>,
+}
+
+impl PinnedMessagesRoundTrip<'_, '_> {
+	async fn build_round_request(
+		&mut self,
+		body: Vec<u8>,
+	) -> Result<Request, llm::tool_runtime::ToolRuntimeError> {
+		let mut request = self
+			.template
+			.build(body)
+			.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		if let Some(auth) = self.backend_call.backend_policies.backend_auth.as_ref() {
+			auth::apply_backend_auth(self.backend_info, auth, &mut request)
+				.await
+				.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		}
+		self
+			.llm
+			.provider
+			.setup_request(
+				&mut request,
+				self.upstream_route_type,
+				Some(self.llm_request),
+				self.llm.path_override.as_deref(),
+				self.llm.path_prefix.as_deref(),
+				self.llm.host_override.is_some(),
+			)
+			.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		self.llm.provider.strip_browser_cors_headers(&mut request);
+		apply_auto_hostname(&mut request, &self.backend_call.target)
+			.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		auth::apply_late_backend_auth(
+			self.backend_call.backend_policies.backend_auth.as_ref(),
+			&mut request,
+		)
+		.await
+		.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		Ok(request)
+	}
+}
+
+#[async_trait::async_trait]
+impl llm::tool_runtime::ModelRoundTrip<llm::types::messages::Request, llm::BufferedMessagesRound>
+	for PinnedMessagesRoundTrip<'_, '_>
+{
+	async fn execute_round(
+		&mut self,
+		canonical_request: &llm::types::messages::Request,
+		_remaining: Duration,
+	) -> Result<
+		llm::tool_runtime::runner::ModelRound<llm::BufferedMessagesRound>,
+		llm::tool_runtime::ToolRuntimeError,
+	> {
+		let request = if let Some(request) = self.first_request.take() {
+			request
+		} else {
+			let body = self
+				.llm
+				.provider
+				.rerender_messages_request(
+					self.llm_request_policies.llm.as_deref(),
+					canonical_request,
+					self.upstream_route_type,
+					&self.template.headers,
+					self.log,
+					self.llm_request,
+				)
+				.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+			self.build_round_request(body).await?
+		};
+
+		let response = match call_pinned_upstream(
+			self.inputs,
+			request,
+			&self.backend_call.target,
+			self.connection,
+			self.backend_call.span_target.as_ref(),
+			self.outbound_labels,
+			self.log,
+		)
+		.await
+		{
+			Ok(response) => response,
+			Err(error) => {
+				return Ok(llm::tool_runtime::runner::ModelRound::InfrastructureError(
+					Box::new(error.into_response_with_grpc(false)),
+				));
+			},
+		};
+		let buffered = self
+			.llm
+			.provider
+			.buffer_responses_round_response(response)
+			.await
+			.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		if !buffered.status().is_success() {
+			return Ok(llm::tool_runtime::runner::ModelRound::UpstreamError(
+				Box::new(buffered.into_response()),
+			));
+		}
+		let round = self
+			.llm
+			.provider
+			.translate_prebuffered_messages_round(self.llm_request, self.upstream_route_type, buffered)
+			.map_err(|_| llm::tool_runtime::ToolRuntimeError::internal())?;
+		Ok(llm::tool_runtime::runner::ModelRound::Success(Box::new(
+			round,
+		)))
+	}
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_managed_responses_runtime(
 	inputs: &Arc<ProxyInputs>,
@@ -2476,9 +2614,9 @@ async fn run_managed_responses_runtime(
 	log: &mut Option<&mut RequestLog>,
 ) -> Result<llm::ResponseProcessingInput, ProxyResponse> {
 	let mut budget = llm::tool_runtime::RuntimeBudget::new_at(
-		&runtime.registry,
+		&runtime.state.registry,
 		policy_client.clone(),
-		runtime.deadline,
+		runtime.state.deadline,
 	)
 	.map_err(|error| ProxyResponse::DirectResponse(Box::new(error.into_openai_response())))?;
 	budget.set_request_id(
@@ -2508,6 +2646,65 @@ async fn run_managed_responses_runtime(
 		},
 		Err(llm::tool_runtime::runner::RunError::Runtime(error)) => Err(ProxyResponse::DirectResponse(
 			Box::new(error.into_openai_response()),
+		)),
+		Err(llm::tool_runtime::runner::RunError::DirectResponse(response)) => {
+			Err(ProxyResponse::DirectResponse(response))
+		},
+	}
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_managed_messages_runtime(
+	inputs: &Arc<ProxyInputs>,
+	policy_client: &PolicyClient,
+	backend_info: &auth::BackendInfo,
+	backend_call: &BackendCall,
+	llm_request_policies: &store::LLMRequestPolicies,
+	llm: &llm::NamedAIProvider,
+	runtime: Box<llm::tool_runtime::messages::PreparedMessagesRuntime>,
+	template: &ResponsesRoundRequestTemplate,
+	upstream_route_type: RouteType,
+	llm_request: &mut LLMRequest,
+	request: Request,
+	connection: &client::ConnectionConfig,
+	outbound_labels: &OutboundCallLabels,
+	log: &mut Option<&mut RequestLog>,
+) -> Result<llm::ResponseProcessingInput, ProxyResponse> {
+	let mut budget = llm::tool_runtime::RuntimeBudget::new_at(
+		&runtime.state.registry,
+		policy_client.clone(),
+		runtime.state.deadline,
+	)
+	.map_err(|error| ProxyResponse::DirectResponse(Box::new(error.into_anthropic_response())))?;
+	budget.set_request_id(
+		log
+			.as_ref()
+			.and_then(|log| log.request_id)
+			.map(|request_id| Strng::from(request_id.to_string())),
+	);
+	let mut round_trip = PinnedMessagesRoundTrip {
+		inputs,
+		backend_info,
+		backend_call,
+		llm_request_policies,
+		llm,
+		template,
+		upstream_route_type,
+		llm_request,
+		first_request: Some(request),
+		connection,
+		outbound_labels,
+		log,
+	};
+	match llm::tool_runtime::runner::run(*runtime, budget, &mut round_trip).await {
+		Ok(result) => Ok(llm::ResponseProcessingInput::ManagedMessages(Box::new(
+			result,
+		))),
+		Err(llm::tool_runtime::runner::RunError::UpstreamResponse(response)) => {
+			Ok(llm::ResponseProcessingInput::Upstream(*response))
+		},
+		Err(llm::tool_runtime::runner::RunError::Runtime(error)) => Err(ProxyResponse::DirectResponse(
+			Box::new(error.into_anthropic_response()),
 		)),
 		Err(llm::tool_runtime::runner::RunError::DirectResponse(response)) => {
 			Err(ProxyResponse::DirectResponse(response))
@@ -2989,7 +3186,7 @@ async fn make_backend_call(
 					tool_request_template = prepared_tool_runtime
 						.as_ref()
 						.map(|_| Box::new(ResponsesRoundRequestTemplate::from_request(&req)));
-					tool_runtime = prepared_tool_runtime.map(Box::new);
+					tool_runtime = prepared_tool_runtime;
 					tool_upstream_route_type = Some(upstream_route_type);
 					dtrace::trace(|trace| {
 						trace.llm_request_detected(
@@ -3172,40 +3369,74 @@ async fn make_backend_call(
 		kind: OutboundCallKind::Primary,
 		subtype: outbound_subtype,
 	};
-	let (mut resp, managed_tool_runtime_handled) = if let Some(runtime) = tool_runtime {
-		let llm = backend_call
-			.backend_policies
-			.llm_provider
-			.as_ref()
-			.expect("managed Responses runtime requires an LLM provider");
-		let template = tool_request_template
-			.as_deref()
-			.expect("managed Responses runtime requires a request template");
-		let upstream_route_type =
-			tool_upstream_route_type.expect("managed Responses runtime requires a provider route");
-		let llm_request = llm_request
-			.as_mut()
-			.expect("managed Responses runtime requires request metadata");
-		let response = Box::pin(run_managed_responses_runtime(
-			&inputs,
-			&policy_client,
-			&backend_info,
-			&backend_call,
-			llm_request_policies.as_ref(),
-			llm.as_ref(),
-			runtime,
-			template,
-			upstream_route_type,
-			llm_request,
-			req,
-			&connection,
-			&outbound_labels,
-			&mut log,
-		))
-		.await?;
-		(response, true)
-	} else {
-		(
+	let (mut resp, managed_tool_runtime_handled) = match tool_runtime {
+		Some(llm::PreparedManagedRuntime::Responses(runtime)) => {
+			let llm = backend_call
+				.backend_policies
+				.llm_provider
+				.as_ref()
+				.expect("managed Responses runtime requires an LLM provider");
+			let template = tool_request_template
+				.as_deref()
+				.expect("managed Responses runtime requires a request template");
+			let upstream_route_type =
+				tool_upstream_route_type.expect("managed Responses runtime requires a provider route");
+			let llm_request = llm_request
+				.as_mut()
+				.expect("managed Responses runtime requires request metadata");
+			let response = Box::pin(run_managed_responses_runtime(
+				&inputs,
+				&policy_client,
+				&backend_info,
+				&backend_call,
+				llm_request_policies.as_ref(),
+				llm.as_ref(),
+				runtime,
+				template,
+				upstream_route_type,
+				llm_request,
+				req,
+				&connection,
+				&outbound_labels,
+				&mut log,
+			))
+			.await?;
+			(response, true)
+		},
+		Some(llm::PreparedManagedRuntime::Messages(runtime)) => {
+			let llm = backend_call
+				.backend_policies
+				.llm_provider
+				.as_ref()
+				.expect("managed Messages runtime requires an LLM provider");
+			let template = tool_request_template
+				.as_deref()
+				.expect("managed Messages runtime requires a request template");
+			let upstream_route_type =
+				tool_upstream_route_type.expect("managed Messages runtime requires a provider route");
+			let llm_request = llm_request
+				.as_mut()
+				.expect("managed Messages runtime requires request metadata");
+			let response = Box::pin(run_managed_messages_runtime(
+				&inputs,
+				&policy_client,
+				&backend_info,
+				&backend_call,
+				llm_request_policies.as_ref(),
+				llm.as_ref(),
+				runtime,
+				template,
+				upstream_route_type,
+				llm_request,
+				req,
+				&connection,
+				&outbound_labels,
+				&mut log,
+			))
+			.await?;
+			(response, true)
+		},
+		None => (
 			llm::ResponseProcessingInput::Upstream(
 				call_pinned_upstream(
 					&inputs,
@@ -3219,7 +3450,7 @@ async fn make_backend_call(
 				.await?,
 			),
 			false,
-		)
+		),
 	};
 	if let Some(log) = log.as_ref() {
 		resp

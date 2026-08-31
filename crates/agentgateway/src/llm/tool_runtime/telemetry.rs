@@ -161,6 +161,30 @@ pub struct ToolRuntimeOutcomeLabels {
 	pub outcome: ToolRuntimeOutcome,
 }
 
+/// The inbound wire format that drove a managed request.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum ManagedFormat {
+	Responses,
+	Messages,
+}
+
+impl ManagedFormat {
+	pub(crate) fn as_str(&self) -> &'static str {
+		match self {
+			Self::Responses => "responses",
+			Self::Messages => "messages",
+		}
+	}
+}
+
+encode_bounded_label!(ManagedFormat);
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ToolRuntimeRequestLabels {
+	pub outcome: ToolRuntimeOutcome,
+	pub format: ManagedFormat,
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct ToolCallLabels {
 	pub tool: String,
@@ -212,8 +236,22 @@ struct StartedCall {
 	executing: bool,
 }
 
-#[derive(Default)]
+impl Default for ToolRuntimeTelemetryState {
+	fn default() -> Self {
+		Self {
+			managed_format: ManagedFormat::Responses,
+			records: BTreeMap::new(),
+			started_calls: HashMap::new(),
+			started_rounds: HashMap::new(),
+			recorded_rounds: BTreeSet::new(),
+			started_sandbox_operations: HashMap::new(),
+			recorded_sandbox_operations: BTreeSet::new(),
+		}
+	}
+}
+
 struct ToolRuntimeTelemetryState {
+	managed_format: ManagedFormat,
 	records: BTreeMap<usize, ToolExecutionRecord>,
 	started_calls: HashMap<usize, StartedCall>,
 	started_rounds: HashMap<usize, (Instant, tracing::Span)>,
@@ -436,6 +474,14 @@ impl ToolRuntimeTelemetry {
 		}
 	}
 
+	pub(crate) fn set_managed_format(&self, format: ManagedFormat) {
+		self.lock_state().managed_format = format;
+	}
+
+	fn managed_format(&self) -> ManagedFormat {
+		self.lock_state().managed_format
+	}
+
 	pub(crate) fn record_request(&self, outcome: ToolRuntimeOutcome) {
 		if self
 			.request_recorded
@@ -447,7 +493,10 @@ impl ToolRuntimeTelemetry {
 		if let Some(metrics) = &self.metrics {
 			metrics
 				.tool_runtime_requests
-				.get_or_create(&ToolRuntimeOutcomeLabels { outcome })
+				.get_or_create(&ToolRuntimeRequestLabels {
+					outcome,
+					format: self.managed_format(),
+				})
 				.inc();
 		}
 	}

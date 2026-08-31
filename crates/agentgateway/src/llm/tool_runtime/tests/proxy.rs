@@ -122,6 +122,17 @@ impl Drop for StalledBodyServer {
 	}
 }
 
+fn openai_provider() -> llm::AIProvider {
+	llm::AIProvider::OpenAI(llm::openai::Provider {
+		model: None,
+		moderation: None,
+	})
+}
+
+fn anthropic_provider() -> llm::AIProvider {
+	llm::AIProvider::Anthropic(llm::anthropic::Provider { model: None })
+}
+
 fn responses_body(
 	output: serde_json::Value,
 	input_tokens: u64,
@@ -140,6 +151,71 @@ fn responses_body(
 			"total_tokens": input_tokens + output_tokens
 		}
 	})
+}
+
+fn messages_body(
+	content: serde_json::Value,
+	stop_reason: &str,
+	input: u64,
+	output: u64,
+) -> serde_json::Value {
+	json!({
+		"id": "msg_1",
+		"type": "message",
+		"role": "assistant",
+		"model": "mock-claude",
+		"stop_reason": stop_reason,
+		"stop_sequence": null,
+		"usage": {"input_tokens": input, "output_tokens": output},
+		"content": content
+	})
+}
+
+fn messages_tool_use(id: &str, name: &str, input: serde_json::Value) -> serde_json::Value {
+	json!({"type": "tool_use", "id": id, "name": name, "input": input})
+}
+
+fn managed_messages_tools() -> serde_json::Value {
+	json!([{
+		"name": "managed",
+		"description": "managed tool",
+		"input_schema": {
+			"type": "object",
+			"properties": {"city": {"type": "string"}},
+			"required": ["city"],
+			"additionalProperties": false
+		}
+	}])
+}
+
+#[allow(dead_code)]
+fn programmatic_messages_tools() -> serde_json::Value {
+	json!([
+		{"type": "code_execution_20260120", "name": "code_execution"},
+		{
+			"name": "managed",
+			"description": "managed tool",
+			"allowed_callers": ["code_execution_20260120"],
+			"input_schema": {
+				"type": "object",
+				"properties": {"city": {"type": "string"}},
+				"required": ["city"],
+				"additionalProperties": false
+			}
+		}
+	])
+}
+
+fn completions_body_with_tool_call(
+	call_id: &str,
+	name: &str,
+	arguments: &str,
+) -> serde_json::Value {
+	json!({"id":"chatcmpl_1","object":"chat.completion","created":1,"model":"mock-openai","choices":[{"index":0,"finish_reason":"tool_calls","message":{"role":"assistant","tool_calls":[{"id":call_id,"type":"function","function":{"name":name,"arguments":arguments}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}})
+}
+
+fn completions_body_with_text(text: &str) -> serde_json::Value {
+	json!({"id":"chatcmpl_2","object":"chat.completion","created":1,"model":"mock-openai","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":text}}],"usage":{"prompt_tokens":12,"completion_tokens":6,"total_tokens":18}})
 }
 
 fn function_call(name: &str, call_id: &str, arguments: &str) -> serde_json::Value {
@@ -197,30 +273,42 @@ async fn response_json(response: http::Response) -> serde_json::Value {
 	serde_json::from_slice(&proxymock::read_body_raw(response.into_body()).await).unwrap()
 }
 
+async fn response_body_string(response: http::Response) -> String {
+	String::from_utf8(
+		proxymock::read_body_raw(response.into_body())
+			.await
+			.to_vec(),
+	)
+	.unwrap()
+}
+
 fn managed_tool_backend(
 	model: &wiremock::MockServer,
 	tool: &wiremock::MockServer,
 	limits: llm::tool_runtime::RuntimeLimits,
+	provider: llm::AIProvider,
 ) -> crate::types::agent::BackendWithPolicies {
-	managed_tool_backend_for_models(&[("mock-openai", model)], tool, limits)
+	managed_tool_backend_for_models(&[("mock-openai", model)], tool, limits, provider)
 }
 
 fn managed_tool_backend_for_models(
 	models: &[(&str, &wiremock::MockServer)],
 	tool: &wiremock::MockServer,
 	limits: llm::tool_runtime::RuntimeLimits,
+	provider: llm::AIProvider,
 ) -> crate::types::agent::BackendWithPolicies {
 	let models = models
 		.iter()
 		.map(|(name, model)| (*name, *model.address()))
 		.collect::<Vec<_>>();
-	managed_tool_backend_for_addresses(&models, tool, limits)
+	managed_tool_backend_for_addresses(&models, tool, limits, provider)
 }
 
 fn managed_tool_backend_for_addresses(
 	models: &[(&str, SocketAddr)],
 	tool: &wiremock::MockServer,
 	limits: llm::tool_runtime::RuntimeLimits,
+	provider: llm::AIProvider,
 ) -> crate::types::agent::BackendWithPolicies {
 	let runtime = llm::tool_runtime::ToolRuntimeConfig {
 		limits,
@@ -249,10 +337,7 @@ fn managed_tool_backend_for_addresses(
 			let provider_name = agent_core::strng::new(*name);
 			let provider = llm::NamedAIProvider {
 				name: provider_name.clone(),
-				provider: llm::AIProvider::OpenAI(llm::openai::Provider {
-					model: None,
-					moderation: None,
-				}),
+				provider: provider.clone(),
 				provider_backend: None,
 				host_override: Some(Target::Address(*model)),
 				path_override: None,
@@ -299,11 +384,332 @@ async fn managed_tool_proxy(
 ) {
 	let bind = proxymock::setup_proxy_test("{}")
 		.expect("proxy test harness")
-		.with_raw_backend(managed_tool_backend(model, tool, limits))
+		.with_raw_backend(managed_tool_backend(model, tool, limits, openai_provider()))
 		.with_bind(proxymock::simple_bind())
 		.with_route(proxymock::basic_named_route("/managed-llm".into()));
 	let io = bind.serve_http(proxymock::BIND_KEY);
 	(bind, io)
+}
+
+async fn managed_messages_proxy(
+	model: &wiremock::MockServer,
+	tool: &wiremock::MockServer,
+) -> (
+	proxymock::TestBind,
+	hyper_util::client::legacy::Client<proxymock::MemoryConnector, http::Body>,
+) {
+	let bind = proxymock::setup_proxy_test("{}")
+		.expect("proxy test harness")
+		.with_raw_backend(managed_tool_backend(
+			model,
+			tool,
+			runtime_limits(),
+			anthropic_provider(),
+		))
+		.with_bind(proxymock::simple_bind())
+		.with_route(proxymock::basic_named_route("/managed-llm".into()));
+	let io = bind.serve_http(proxymock::BIND_KEY);
+	(bind, io)
+}
+
+async fn send_messages_request(
+	io: hyper_util::client::legacy::Client<proxymock::MemoryConnector, http::Body>,
+	tools: serde_json::Value,
+	stream: bool,
+) -> crate::http::Response {
+	let body = json!({
+		"model": "managed",
+		"max_tokens": 256,
+		"stream": stream,
+		"messages": [{"role": "user", "content": "weather in Paris?"}],
+		"tools": tools
+	});
+	proxymock::send_request_body(
+		io,
+		Method::POST,
+		"http://lo/v1/messages",
+		body.to_string().as_bytes(),
+	)
+	.await
+}
+
+#[tokio::test]
+async fn messages_managed_tool_call_loops_and_returns_only_final_answer() {
+	let model = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(ResponseSequence {
+			responses: Arc::new(vec![
+				messages_body(
+					json!([messages_tool_use(
+						"toolu_1",
+						"managed",
+						json!({"city": "Paris"})
+					)]),
+					"tool_use",
+					10,
+					4,
+				),
+				messages_body(json!([{"type": "text", "text": "22 C"}]), "end_turn", 12, 6),
+			]),
+			next: Arc::new(AtomicUsize::new(0)),
+		})
+		.mount(&model)
+		.await;
+	let tool = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({"temp_c": 22})))
+		.mount(&tool)
+		.await;
+	let (bind, io) = managed_messages_proxy(&model, &tool).await;
+	let _ = bind;
+
+	let response = send_messages_request(io, managed_messages_tools(), false).await;
+	assert_eq!(response.status(), 200);
+	let body = response_json(response).await;
+	assert_eq!(body["content"][0]["text"], "22 C");
+	assert_eq!(body["content"].as_array().unwrap().len(), 1);
+	assert_eq!(body["stop_reason"], "end_turn");
+	assert_eq!(body["usage"]["input_tokens"], 22);
+	assert_eq!(body["usage"]["output_tokens"], 10);
+	let model_requests = model.received_requests().await.unwrap();
+	assert_eq!(model_requests.len(), 2);
+	assert!(model_requests.iter().all(|request| {
+		serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["operator_round_marker"]
+			== true
+	}));
+	let second_request: serde_json::Value = serde_json::from_slice(&model_requests[1].body).unwrap();
+	let tool_result = &second_request["messages"][2]["content"][0];
+	assert_eq!(tool_result["type"], "tool_result");
+	assert_eq!(tool_result["tool_use_id"], "toolu_1");
+	assert!(
+		second_request["messages"][2]["content"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.all(|block| block["type"] != "function_call_output")
+	);
+	assert_eq!(tool.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn messages_managed_zero_call_round_returns_the_first_response() {
+	let model = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(messages_body(
+			json!([{"type": "text", "text": "no tool needed"}]),
+			"end_turn",
+			5,
+			3,
+		)))
+		.mount(&model)
+		.await;
+	let tool = wiremock::MockServer::start().await;
+	let (bind, io) = managed_messages_proxy(&model, &tool).await;
+	let _ = bind;
+
+	let response = send_messages_request(io, managed_messages_tools(), false).await;
+	assert_eq!(response.status(), 200);
+	let body = response_json(response).await;
+	assert_eq!(body["content"][0]["text"], "no tool needed");
+	assert_eq!(body["usage"]["input_tokens"], 5);
+	assert_eq!(model.received_requests().await.unwrap().len(), 1);
+	assert_eq!(tool.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn messages_managed_tool_runtime_streams_only_the_final_answer() {
+	let model = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(ResponseSequence {
+			responses: Arc::new(vec![
+				messages_body(
+					json!([messages_tool_use(
+						"toolu_1",
+						"managed",
+						json!({"city": "Paris"})
+					)]),
+					"tool_use",
+					10,
+					4,
+				),
+				messages_body(json!([{"type": "text", "text": "22 C"}]), "end_turn", 12, 6),
+			]),
+			next: Arc::new(AtomicUsize::new(0)),
+		})
+		.mount(&model)
+		.await;
+	let tool = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({"temp_c": 22})))
+		.mount(&tool)
+		.await;
+	let (bind, io) = managed_messages_proxy(&model, &tool).await;
+	let _ = bind;
+
+	let response = send_messages_request(io, managed_messages_tools(), true).await;
+	assert_eq!(response.status(), 200);
+	assert_eq!(
+		response
+			.headers()
+			.get(http::header::CONTENT_TYPE)
+			.and_then(|v| v.to_str().ok()),
+		Some("text/event-stream")
+	);
+	let body = response_body_string(response).await;
+	assert!(body.starts_with("event: message_start\n"));
+	assert!(body.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
+	assert!(body.contains("\"text\":\"22 C\""));
+	assert!(!body.contains("toolu_1"));
+	assert!(!body.contains("[DONE]"));
+	for request in model.received_requests().await.unwrap() {
+		let value: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+		assert_eq!(value["stream"], false, "{value}");
+	}
+}
+
+#[tokio::test]
+async fn messages_managed_round_limit_returns_an_anthropic_error() {
+	let model = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(messages_body(
+			json!([messages_tool_use(
+				"toolu_1",
+				"managed",
+				json!({"city": "Paris"})
+			)]),
+			"tool_use",
+			10,
+			4,
+		)))
+		.mount(&model)
+		.await;
+	let tool = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({"temp_c": 22})))
+		.mount(&tool)
+		.await;
+	let (bind, io) = managed_messages_proxy(&model, &tool).await;
+	let _ = bind;
+
+	let response = send_messages_request(io, managed_messages_tools(), false).await;
+	assert_eq!(response.status(), 400);
+	let body = response_json(response).await;
+	assert_eq!(body["type"], "error");
+	assert_eq!(body["error"]["type"], "invalid_request_error");
+	assert!(body.get("error").and_then(|e| e.get("code")).is_none());
+}
+
+#[tokio::test]
+async fn messages_managed_runtime_completes_against_an_openai_completions_upstream() {
+	let model = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(ResponseSequence {
+			responses: Arc::new(vec![
+				completions_body_with_tool_call("call_1", "managed", "{\"city\":\"Paris\"}"),
+				completions_body_with_text("22 C"),
+			]),
+			next: Arc::new(AtomicUsize::new(0)),
+		})
+		.mount(&model)
+		.await;
+	let tool = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({"temp_c": 22})))
+		.mount(&tool)
+		.await;
+	let bind = proxymock::setup_proxy_test("{}")
+		.expect("proxy test harness")
+		.with_raw_backend(managed_tool_backend(
+			&model,
+			&tool,
+			runtime_limits(),
+			openai_provider(),
+		))
+		.with_bind(proxymock::simple_bind())
+		.with_route(proxymock::basic_named_route("/managed-llm".into()));
+	let io = bind.serve_http(proxymock::BIND_KEY);
+
+	let response = send_messages_request(io, managed_messages_tools(), false).await;
+	assert_eq!(response.status(), 200);
+	let body = response_json(response).await;
+	assert_eq!(body["type"], "message");
+	assert_eq!(body["content"][0]["text"], "22 C");
+	assert_eq!(model.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn messages_active_runtime_sanitizes_later_model_error_without_retry() {
+	let model = wiremock::MockServer::start().await;
+	let call_id = "toolu_sensitive_1";
+	let function_round = messages_body(
+		json!([messages_tool_use(
+			call_id,
+			"managed",
+			json!({"city": "Paris"})
+		)]),
+		"tool_use",
+		10,
+		4,
+	);
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(StatusResponseSequence {
+			responses: Arc::new(vec![
+				(200, function_round.clone()),
+				(
+					500,
+					json!({
+						"type": "error",
+						"error": {"type": "api_error", "message": "SENSITIVE_MODEL_ECHO"},
+						"echo": {"stdout": "SENSITIVE_STDOUT", "call_id": call_id}
+					}),
+				),
+				(200, function_round),
+			]),
+			next: Arc::new(AtomicUsize::new(0)),
+		})
+		.mount(&model)
+		.await;
+	let tool = wiremock::MockServer::start().await;
+	Mock::given(wiremock::matchers::method("POST"))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+			"stdout": "SENSITIVE_STDOUT",
+			"result_url": "https://results.invalid/private"
+		})))
+		.mount(&tool)
+		.await;
+	let mut bind = proxymock::setup_proxy_test("{}")
+		.expect("proxy test harness")
+		.with_raw_backend(managed_tool_backend(
+			&model,
+			&tool,
+			runtime_limits(),
+			anthropic_provider(),
+		))
+		.with_bind(proxymock::simple_bind())
+		.with_route(proxymock::basic_named_route("/managed-llm".into()));
+	bind
+		.attach_route_policy(json!({
+			"retry": {"attempts": 1, "codes": [500, 502]}
+		}))
+		.await;
+	let io = bind.serve_http(proxymock::BIND_KEY);
+
+	let response = send_messages_request(io, managed_messages_tools(), false).await;
+	assert_eq!(response.status(), 502);
+	let body = response_json(response).await;
+	assert_eq!(body["type"], "error");
+	assert_eq!(body["error"]["type"], "api_error");
+	let serialized = body.to_string();
+	for sensitive in [
+		"SENSITIVE_MODEL_ECHO",
+		"SENSITIVE_STDOUT",
+		"https://results.invalid/private",
+		call_id,
+	] {
+		assert!(!serialized.contains(sensitive), "leaked {sensitive}");
+	}
+	assert_eq!(model.received_requests().await.unwrap().len(), 2);
+	assert_eq!(tool.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -529,6 +935,7 @@ async fn responses_managed_tool_runtime_pins_initial_provider_for_every_round() 
 			&[("model-a", &model_a), ("model-b", &model_b)],
 			&tool,
 			runtime_limits(),
+			openai_provider(),
 		))
 		.with_bind(proxymock::simple_bind())
 		.with_route(proxymock::basic_named_route("/managed-llm".into()));
@@ -620,6 +1027,7 @@ async fn responses_managed_tool_runtime_deadline_covers_body_after_headers() {
 			&[("stalled-model", model.address)],
 			&tool,
 			limits,
+			openai_provider(),
 		))
 		.with_bind(proxymock::simple_bind())
 		.with_route(proxymock::basic_named_route("/managed-llm".into()));
@@ -684,7 +1092,12 @@ async fn responses_active_runtime_sanitizes_later_model_error_without_retry() {
 		.await;
 	let mut bind = proxymock::setup_proxy_test("{}")
 		.expect("proxy test harness")
-		.with_raw_backend(managed_tool_backend(&model, &tool, runtime_limits()))
+		.with_raw_backend(managed_tool_backend(
+			&model,
+			&tool,
+			runtime_limits(),
+			openai_provider(),
+		))
 		.with_bind(proxymock::simple_bind())
 		.with_route(proxymock::basic_named_route("/managed-llm".into()));
 	bind

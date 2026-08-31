@@ -916,6 +916,9 @@ async fn responses_tool_runtime_activates_after_request_policy_defaults() {
 		panic!("expected active managed tool runtime");
 	};
 
+	let crate::llm::PreparedManagedRuntime::Responses(runtime) = runtime else {
+		panic!("expected Responses runtime");
+	};
 	let forwarded = forwarded.collect().await.unwrap().to_bytes();
 	let forwarded: Value = serde_json::from_slice(&forwarded).unwrap();
 	assert_eq!(forwarded["tools"][0]["name"], "managed");
@@ -923,6 +926,98 @@ async fn responses_tool_runtime_activates_after_request_policy_defaults() {
 		serde_json::to_value(runtime.canonical_request).unwrap()["tools"][0]["description"],
 		"added by policy"
 	);
+}
+
+#[tokio::test]
+async fn messages_tool_runtime_activates_after_request_policy_prompts() {
+	use std::sync::Arc;
+	use std::time::Duration;
+
+	use secrecy::SecretString;
+
+	use crate::llm::policy::PromptEnrichment;
+	use crate::llm::tool_runtime::{
+		ManagedToolConfig, RuntimeLimits, ToolBackendConfig, ToolRegistry, ToolRuntimeConfig,
+	};
+
+	let provider = AIProvider::Anthropic(anthropic::Provider { model: None });
+	let backend_info = openai_test_backend_info();
+	let policy = Policy {
+		tool_runtime: Some(Arc::new(
+			ToolRegistry::compile(ToolRuntimeConfig {
+				limits: RuntimeLimits {
+					total_timeout: Duration::from_secs(30),
+					max_rounds: 4,
+					max_tool_calls: 4,
+					max_parallel_tool_calls: 2,
+					max_arguments_bytes: 1024,
+					max_output_bytes: 4096,
+				},
+				tools: vec![ManagedToolConfig {
+					name: "managed".to_owned(),
+					builtin: None,
+					backend: ToolBackendConfig::Http {
+						url: "http://127.0.0.1:1/invoke".parse().unwrap(),
+						timeout: Duration::from_secs(5),
+						bearer_token: Some(SecretString::from("operator-secret")),
+					},
+				}],
+			})
+			.unwrap(),
+		)),
+		prompts: Some(PromptEnrichment {
+			prepend: vec![SimpleChatCompletionMessage {
+				role: strng::new("system"),
+				content: strng::new("policy system"),
+			}],
+			append: vec![],
+		}),
+		..Default::default()
+	};
+	let request = ::http::Request::builder()
+		.uri("/v1/messages")
+		.header(::http::header::CONTENT_TYPE, "application/json")
+		.body(Body::from(
+			br#"{
+				"model":"claude-x",
+				"max_tokens":64,
+				"messages":[{"role":"user","content":"hello"}],
+				"tools":[{"name":"managed","input_schema":{"type":"object"}}]
+			}"#
+				.to_vec(),
+		))
+		.unwrap();
+
+	let RequestResult::Success {
+		request: forwarded,
+		tool_runtime: Some(runtime),
+		..
+	} = provider
+		.process_messages_request(
+			&backend_info,
+			Some(&policy),
+			request,
+			false,
+			&mut None,
+			None,
+		)
+		.await
+		.expect("managed Messages request should process")
+	else {
+		panic!("expected active managed tool runtime");
+	};
+
+	let crate::llm::PreparedManagedRuntime::Messages(runtime) = runtime else {
+		panic!("expected Messages runtime");
+	};
+	let forwarded = forwarded.collect().await.unwrap().to_bytes();
+	let forwarded: Value = serde_json::from_slice(&forwarded).unwrap();
+	let canonical = serde_json::to_value(runtime.canonical_request).unwrap();
+
+	assert_eq!(forwarded["system"][0]["text"], "policy system");
+	assert_eq!(canonical["system"][0]["text"], "policy system");
+	assert_eq!(forwarded["tools"][0]["name"], "managed");
+	assert_eq!(canonical["tools"][0]["name"], "managed");
 }
 
 #[derive(Clone)]

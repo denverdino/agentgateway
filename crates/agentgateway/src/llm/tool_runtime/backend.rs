@@ -114,12 +114,20 @@ impl ToolInfrastructureError {
 		})
 	}
 
+	#[allow(dead_code)]
+	pub fn to_anthropic_error(self) -> Value {
+		json!({
+			"type": "error",
+			"error": {"type": "api_error", "message": self.public_message()}
+		})
+	}
+
 	#[cfg(test)]
 	pub(crate) fn sanitized_openai_error(self) -> Value {
 		self.to_openai_error()
 	}
 
-	fn public_message(self) -> &'static str {
+	pub(crate) fn public_message(self) -> &'static str {
 		match self {
 			Self::Authentication => "managed tool backend authentication failed",
 			Self::Timeout => "managed tool execution timed out",

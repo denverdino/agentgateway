@@ -311,16 +311,19 @@ pub(crate) fn prepare(
 		.collect();
 	let programmatic_catalog_bytes = super::programmatic_catalog_bytes(&programmatic_tools)?;
 	let mut prepared = PreparedToolRuntime {
-		registry: prepared_registry,
+		state: super::ManagedToolState {
+			registry: prepared_registry,
+			parallel,
+			deadline,
+			programmatic_requested,
+			programmatic_tools: Arc::new(programmatic_tools),
+			programmatic_catalog_bytes,
+		},
 		canonical_request: request.clone(),
-		programmatic_requested,
-		programmatic_tools: Arc::new(programmatic_tools),
-		programmatic_catalog_bytes,
-		parallel,
 		client_streaming,
 		include_obfuscation,
 		client_tools,
-		deadline,
+		accumulated_usage: Box::new(None),
 		pending_remote_mcp,
 		tool_search: tool_search_requested.then(|| Box::new(ToolSearchState::new(deferred_tools))),
 	};
@@ -514,7 +517,7 @@ fn remote_mcp_options(declaration: &Value) -> Result<RemoteMcpServer, ToolRuntim
 			));
 		}
 	}
-	let allowed_callers = parse_allowed_callers(declaration.allowed_callers)?;
+	let allowed_callers = parse_allowed_callers(declaration.allowed_callers, false)?;
 	let defer_loading = declaration.defer_loading.unwrap_or(false);
 	if defer_loading && allowed_callers.programmatic {
 		return Err(ToolRuntimeError::invalid_request(
@@ -654,7 +657,7 @@ fn web_search_options(declaration: &Value) -> Result<(Value, AllowedCallers), To
 	}
 	Ok((
 		Value::Object(options),
-		parse_allowed_callers(declaration.allowed_callers)?,
+		parse_allowed_callers(declaration.allowed_callers, false)?,
 	))
 }
 
@@ -752,9 +755,15 @@ enum WebSearchUserLocationType {
 
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum Nullable<T> {
+pub(super) enum Nullable<T> {
 	Value(T),
 	Null(()),
+}
+
+impl<T> Default for Nullable<T> {
+	fn default() -> Self {
+		Self::Null(())
+	}
 }
 
 fn code_interpreter_options(declaration: &Value) -> Result<AllowedCallers, ToolRuntimeError> {
@@ -796,14 +805,18 @@ fn code_interpreter_options(declaration: &Value) -> Result<AllowedCallers, ToolR
 				"invalid code_interpreter allowed_callers: {error}"
 			))
 		})?;
-	parse_allowed_callers(callers)
+	parse_allowed_callers(callers, false)
 }
 
-fn parse_allowed_callers(
+pub(super) fn parse_allowed_callers(
 	callers: Option<Vec<AllowedCaller>>,
+	default_programmatic: bool,
 ) -> Result<AllowedCallers, ToolRuntimeError> {
 	let Some(callers) = callers else {
-		return Ok(AllowedCallers::default());
+		return Ok(AllowedCallers {
+			direct: !default_programmatic,
+			programmatic: default_programmatic,
+		});
 	};
 	if callers.is_empty() {
 		return Err(ToolRuntimeError::invalid_request(

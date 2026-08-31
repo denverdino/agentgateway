@@ -265,7 +265,7 @@ enum ChatErrorFormat {
 	Bedrock,
 }
 
-struct ChatTranslation {
+pub(crate) struct ChatTranslation {
 	/// Client-facing chat request/response shape.
 	input: InputFormat,
 	/// Upstream chat wire format used for request, response, stream, and error translation.
@@ -819,6 +819,14 @@ impl ChatTranslation {
 	}
 }
 
+/// A prepared managed runtime, keyed on the inbound wire format.
+#[derive(Debug)]
+pub(crate) enum PreparedManagedRuntime {
+	Responses(Box<tool_runtime::PreparedToolRuntime>),
+	#[allow(dead_code)]
+	Messages(Box<tool_runtime::messages::PreparedMessagesRuntime>),
+}
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum RequestResult {
@@ -826,7 +834,7 @@ pub(crate) enum RequestResult {
 		request: Request,
 		llm_request: LLMRequest,
 		upstream_route_type: RouteType,
-		tool_runtime: Option<tool_runtime::PreparedToolRuntime>,
+		tool_runtime: Option<PreparedManagedRuntime>,
 	},
 	Rejected(Response),
 	GuardrailRejected {
@@ -858,19 +866,30 @@ pub(crate) struct BufferedResponse {
 pub(crate) enum ResponseProcessingInput {
 	Upstream(Response),
 	Managed(Box<tool_runtime::ManagedFinalResponse>),
+	#[allow(dead_code)]
+	ManagedMessages(Box<tool_runtime::messages::ManagedMessagesResponse>),
 }
 
-type ManagedResponseParts = (
-	Box<responses::Response>,
-	Vec<serde_json::Value>,
-	tool_runtime::ToolRuntimeSummary,
-);
+/// A managed runtime result, keyed on the inbound wire format that produced it.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ManagedResponse {
+	Responses(
+		Box<responses::Response>,
+		Vec<serde_json::Value>,
+		tool_runtime::ToolRuntimeSummary,
+	),
+	Messages(
+		Box<types::messages::Response>,
+		tool_runtime::messages::MessagesRuntimeSummary,
+	),
+}
 
 impl ResponseProcessingInput {
 	pub(crate) fn raw_upstream_mut(&mut self) -> &mut Response {
 		match self {
 			Self::Upstream(response) => response,
 			Self::Managed(response) => &mut response.raw_upstream,
+			Self::ManagedMessages(response) => &mut response.raw_upstream,
 		}
 	}
 
@@ -878,10 +897,11 @@ impl ResponseProcessingInput {
 		match self {
 			Self::Upstream(response) => response,
 			Self::Managed(response) => response.raw_upstream,
+			Self::ManagedMessages(response) => response.raw_upstream,
 		}
 	}
 
-	fn into_parts(self) -> (Response, Option<ManagedResponseParts>) {
+	fn into_parts(self) -> (Response, Option<ManagedResponse>) {
 		match self {
 			Self::Upstream(response) => (response, None),
 			Self::Managed(response) => {
@@ -893,7 +913,22 @@ impl ResponseProcessingInput {
 				} = *response;
 				(
 					raw_upstream,
-					Some((Box::new(response), raw_output, summary)),
+					Some(ManagedResponse::Responses(
+						Box::new(response),
+						raw_output,
+						summary,
+					)),
+				)
+			},
+			Self::ManagedMessages(response) => {
+				let tool_runtime::messages::ManagedMessagesResponse {
+					response,
+					raw_upstream,
+					summary,
+				} = *response;
+				(
+					raw_upstream,
+					Some(ManagedResponse::Messages(Box::new(response), summary)),
 				)
 			},
 		}
@@ -909,6 +944,12 @@ impl From<Response> for ResponseProcessingInput {
 pub(crate) struct BufferedResponsesRound {
 	pub(crate) response: responses::Response,
 	pub(crate) raw_output: Vec<serde_json::Value>,
+	pub(crate) reconstructed_upstream: Response,
+}
+
+pub(crate) struct BufferedMessagesRound {
+	pub(crate) response: types::messages::Response,
+	#[allow(dead_code)]
 	pub(crate) reconstructed_upstream: Response,
 }
 
@@ -1738,8 +1779,8 @@ impl AIProvider {
 			.await?;
 		self.apply_model_alias(policies, &mut req);
 
-		self
-			.process_chat_request(
+		let prepared = match self
+			.prepare_chat_request(
 				backend_info,
 				policies,
 				InputFormat::Messages,
@@ -1748,9 +1789,40 @@ impl AIProvider {
 				tokenize,
 				log,
 				catalog,
-				types::ChatRequest::Messages,
 			)
-			.await
+			.await?
+		{
+			Ok(prepared) => prepared,
+			Err(result) => return Ok(result),
+		};
+		let PreparedChatRequest {
+			request: mut req,
+			parts,
+			translation,
+			mut llm_request,
+		} = prepared;
+		let registry = policies.and_then(|policy| policy.tool_runtime.as_ref());
+		let runtime = match tool_runtime::messages::prepare(&mut req, registry) {
+			Ok(tool_runtime::messages::MessagesActivation::Inactive) => None,
+			Ok(tool_runtime::messages::MessagesActivation::Active(prepared)) => Some(prepared),
+			Err(error) => return Ok(RequestResult::Rejected(error.into_anthropic_response())),
+		};
+		if runtime.is_some() {
+			llm_request.streaming = false;
+		}
+		let model_request = runtime.as_ref().map_or_else(
+			|| req.clone(),
+			|prepared| prepared.canonical_request.clone(),
+		);
+		self.render_prepared_chat_request(
+			policies,
+			types::ChatRequest::Messages(model_request),
+			parts,
+			translation,
+			llm_request,
+			log,
+			runtime.map(PreparedManagedRuntime::Messages),
+		)
 	}
 
 	pub(crate) async fn process_gemini_request(
@@ -1899,7 +1971,7 @@ impl AIProvider {
 				llm_request.streaming = false;
 				let client =
 					PolicyClient::new(backend_info.inputs.clone()).with_parent_extensions(&parts.extensions);
-				let deadline = prepared.deadline;
+				let deadline = prepared.state.deadline;
 				if let Err(error) = prepared
 					.initialize_remote_mcp(client, &parts.extensions, deadline)
 					.await
@@ -1921,7 +1993,7 @@ impl AIProvider {
 			translation,
 			llm_request,
 			log,
-			tool_runtime,
+			tool_runtime.map(|prepared| PreparedManagedRuntime::Responses(Box::new(prepared))),
 		)
 	}
 
@@ -1948,6 +2020,59 @@ impl AIProvider {
 					self.provider()
 				))
 			})
+	}
+
+	pub(crate) fn messages_translation_for_route(
+		&self,
+		upstream_route_type: RouteType,
+	) -> Result<&'static ChatTranslation, AIError> {
+		CHAT_TRANSLATIONS
+			.iter()
+			.find(|translation| {
+				translation.input == InputFormat::Messages
+					&& translation.provider_format().route_type() == upstream_route_type
+					&& match self {
+						AIProvider::Bedrock(_) => translation.output == ChatFormat::BedrockConverse,
+						_ => matches!(
+							translation.output,
+							ChatFormat::AnthropicMessages
+								| ChatFormat::OpenAICompletions
+								| ChatFormat::OpenAIResponses
+						),
+					}
+			})
+			.ok_or_else(|| {
+				AIError::UnsupportedConversion(strng::format!(
+					"from Messages via {upstream_route_type:?} to provider {}",
+					self.provider()
+				))
+			})
+	}
+
+	#[allow(dead_code)]
+	pub(crate) fn rerender_messages_request(
+		&self,
+		policies: Option<&Policy>,
+		req: &types::messages::Request,
+		upstream_route_type: RouteType,
+		headers: &HeaderMap,
+		log: &mut Option<&mut RequestLog>,
+		llm_request: &mut LLMRequest,
+	) -> Result<Vec<u8>, AIError> {
+		let translation = self.messages_translation_for_route(upstream_route_type)?;
+		let rendered = translation.render_request(
+			types::ChatRequest::Messages(req.clone()),
+			&ChatRequestContext {
+				provider: self,
+				headers,
+				prompt_caching: policies.and_then(|policy| policy.prompt_caching.as_ref()),
+			},
+		)?;
+		llm_request.provider_state = rendered.provider_state;
+		match policies {
+			Some(policy) => policy.apply_final_transformations(rendered.body, log),
+			None => Ok(rendered.body),
+		}
 	}
 
 	/// Render one canonical managed-tool round for the already-selected provider.
@@ -2333,7 +2458,7 @@ impl AIProvider {
 		translation: &'static ChatTranslation,
 		mut llm_request: LLMRequest,
 		log: &mut Option<&mut RequestLog>,
-		tool_runtime: Option<tool_runtime::PreparedToolRuntime>,
+		tool_runtime: Option<PreparedManagedRuntime>,
 	) -> Result<RequestResult, AIError> {
 		let rendered = translation.render_request(
 			chat_request,
@@ -2599,6 +2724,38 @@ impl AIProvider {
 		})
 	}
 
+	#[allow(dead_code)]
+	pub(crate) fn translate_prebuffered_messages_round(
+		&self,
+		req: &LLMRequest,
+		upstream_route_type: RouteType,
+		buffered: BufferedResponse,
+	) -> Result<BufferedMessagesRound, AIError> {
+		let BufferedResponse { parts, bytes } = buffered;
+		let translation = self.messages_translation_for_route(upstream_route_type)?;
+		let response = if translation.output == ChatFormat::AnthropicMessages {
+			serde_json::from_slice::<types::messages::Response>(&bytes)
+				.map_err(AIError::ResponseParsing)?
+		} else {
+			let translated = translation.render_response(
+				&bytes,
+				&ChatResponseContext {
+					model: &req.request_model,
+					tool_name_map: bedrock_tool_name_map(req),
+				},
+			)?;
+			serde_json::from_slice::<types::messages::Response>(
+				&translated.serialize().map_err(AIError::ResponseParsing)?,
+			)
+			.map_err(AIError::ResponseParsing)?
+		};
+
+		Ok(BufferedMessagesRound {
+			response,
+			reconstructed_upstream: Response::from_parts(parts, Body::from(bytes)),
+		})
+	}
+
 	#[allow(clippy::too_many_arguments)]
 	async fn process_chat_or_detect_buffered_response(
 		&self,
@@ -2608,11 +2765,7 @@ impl AIProvider {
 		req_snapshot: Option<Arc<RequestSnapshot>>,
 		logging: LLMLogging,
 		model_catalog: Option<&catalog::ModelCatalog>,
-		managed_response: Option<(
-			Box<responses::Response>,
-			Vec<serde_json::Value>,
-			tool_runtime::ToolRuntimeSummary,
-		)>,
+		managed_response: Option<ManagedResponse>,
 		buffered: BufferedResponse,
 	) -> Result<Response, AIError> {
 		let LLMLogging {
@@ -2633,67 +2786,102 @@ impl AIProvider {
 		} else {
 			let prompt_guard_headers =
 				response_prompt_guard_headers(&parts.headers, rate_limit.request_traceparent.as_ref());
-			if let Some((mut resp, raw_output, summary)) = managed_response {
-				// Apply response prompt guard to the already-translated managed response.
-				if let Some(dr) = Policy::apply_response_prompt_guard(
-					&client,
-					resp.as_mut(),
-					&prompt_guard_headers,
-					&rate_limit.prompt_guard,
-					req_snapshot.as_deref(),
-					Some(&guardrail_log),
-				)
-				.await
-				.map_err(|e| {
-					warn!("failed to apply response prompt guard: {e}");
-					AIError::PromptWebhookError
-				})? {
-					return Ok(dr);
-				}
-
-				let llm_resp = resp.to_llm_response(log_content);
-				let body = if summary.client_streaming {
-					parts.headers.insert(
-						header::CONTENT_TYPE,
-						header::HeaderValue::from_static("text/event-stream"),
-					);
-					tool_runtime::encode_managed_streaming_response(
-						resp.as_ref(),
-						&raw_output,
-						summary.include_obfuscation,
+			match managed_response {
+				Some(ManagedResponse::Responses(mut resp, raw_output, summary)) => {
+					// Apply response prompt guard to the already-translated managed response.
+					if let Some(dr) = Policy::apply_response_prompt_guard(
+						&client,
+						resp.as_mut(),
+						&prompt_guard_headers,
+						&rate_limit.prompt_guard,
+						req_snapshot.as_deref(),
+						Some(&guardrail_log),
 					)
-					.map_err(AIError::ResponseParsing)?
-				} else {
-					tool_runtime::serialize_managed_response(resp.as_ref(), &raw_output)
-						.map_err(AIError::ResponseParsing)?
-				};
-				(llm_resp, Bytes::from(body))
-			} else {
-				let mut resp = self.translate_chat_or_detect_response(
-					&req,
-					&bytes,
-					model_catalog.map(|c| c.as_handle()),
-				)?;
-				// Apply response prompt guard.
-				if let Some(dr) = Policy::apply_response_prompt_guard(
-					&client,
-					resp.as_mut(),
-					&prompt_guard_headers,
-					&rate_limit.prompt_guard,
-					req_snapshot.as_deref(),
-					Some(&guardrail_log),
-				)
-				.await
-				.map_err(|e| {
-					warn!("failed to apply response prompt guard: {e}");
-					AIError::PromptWebhookError
-				})? {
-					return Ok(dr);
-				}
+					.await
+					.map_err(|e| {
+						warn!("failed to apply response prompt guard: {e}");
+						AIError::PromptWebhookError
+					})? {
+						return Ok(dr);
+					}
 
-				let llm_resp = resp.to_llm_response(log_content);
-				let body = resp.serialize().map_err(AIError::ResponseParsing)?;
-				(llm_resp, Bytes::copy_from_slice(&body))
+					let llm_resp = resp.to_llm_response(log_content);
+					let body = if summary.client_streaming {
+						parts.headers.insert(
+							header::CONTENT_TYPE,
+							header::HeaderValue::from_static("text/event-stream"),
+						);
+						tool_runtime::encode_managed_streaming_response(
+							resp.as_ref(),
+							&raw_output,
+							summary.include_obfuscation,
+						)
+						.map_err(AIError::ResponseParsing)?
+					} else {
+						tool_runtime::serialize_managed_response(resp.as_ref(), &raw_output)
+							.map_err(AIError::ResponseParsing)?
+					};
+					(llm_resp, Bytes::from(body))
+				},
+				Some(ManagedResponse::Messages(mut resp, summary)) => {
+					// Apply response prompt guard to the already-translated managed response.
+					if let Some(dr) = Policy::apply_response_prompt_guard(
+						&client,
+						resp.as_mut(),
+						&prompt_guard_headers,
+						&rate_limit.prompt_guard,
+						req_snapshot.as_deref(),
+						Some(&guardrail_log),
+					)
+					.await
+					.map_err(|e| {
+						warn!("failed to apply response prompt guard: {e}");
+						AIError::PromptWebhookError
+					})? {
+						return Ok(dr);
+					}
+
+					let llm_resp = resp.to_llm_response(log_content);
+					let body = if summary.client_streaming {
+						parts.headers.insert(
+							header::CONTENT_TYPE,
+							header::HeaderValue::from_static("text/event-stream"),
+						);
+						tool_runtime::messages::encode_managed_streaming_response(resp.as_ref())
+							.map_err(AIError::ResponseParsing)?
+					} else {
+						tool_runtime::messages::serialize_managed_response(resp.as_ref())
+							.map_err(AIError::ResponseParsing)?
+					};
+					(llm_resp, Bytes::from(body))
+				},
+				None => {
+					let mut resp = self.translate_chat_or_detect_response(
+						&req,
+						&bytes,
+						model_catalog.map(|c| c.as_handle()),
+					)?;
+					// Apply response prompt guard.
+					if let Some(dr) = Policy::apply_response_prompt_guard(
+						&client,
+						resp.as_mut(),
+						&prompt_guard_headers,
+						&rate_limit.prompt_guard,
+						req_snapshot.as_deref(),
+						Some(&guardrail_log),
+					)
+					.await
+					.map_err(|e| {
+						warn!("failed to apply response prompt guard: {e}");
+						AIError::PromptWebhookError
+					})? {
+						return Ok(dr);
+					}
+
+					let llm_resp = resp.to_llm_response(log_content);
+					let body = resp.serialize().map_err(AIError::ResponseParsing)?;
+					(llm_resp, Bytes::copy_from_slice(&body))
+				},
 			}
 		};
 

@@ -17,6 +17,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::backend::execute_sequentially;
+use super::telemetry;
 use super::{
 	Activation, BuiltinTool, E2bSandboxBackend, HttpToolBackend, ManagedToolCall, ManagedToolConfig,
 	PreparedToolRuntime, ProgramSandbox, ProgramSandboxExecution, ProgramSandboxRequest,
@@ -24,7 +25,7 @@ use super::{
 	RuntimeLimits, SandboxOperation, SandboxOperationLabels, SandboxOperationOutcome,
 	ToolApplicationError, ToolBackend, ToolBackendConfig, ToolBatchExecution,
 	ToolBatchInfrastructureError, ToolBatchMetadata, ToolExecutionContext, ToolExecutionOutcome,
-	ToolExecutionResult, ToolInfrastructureError, ToolRegistry, ToolRuntimeConfig,
+	ToolExecutionResult, ToolInfrastructureError, ToolRegistry, ToolRuntimeConfig, ToolRuntimeError,
 	ToolRuntimeOutcome, aggregate_usage, encode_streaming_response, execute_batch,
 	finalize_managed_response, parse_arguments, prepare,
 };
@@ -36,7 +37,7 @@ use crate::llm::types::responses;
 use crate::proxy::httpproxy::PolicyClient;
 use crate::telemetry::metrics::{Metrics, OutboundCallSubtype};
 
-fn registry(tools: Vec<ManagedToolConfig>) -> Arc<ToolRegistry> {
+pub(super) fn registry(tools: Vec<ManagedToolConfig>) -> Arc<ToolRegistry> {
 	Arc::new(
 		ToolRegistry::compile(ToolRuntimeConfig {
 			limits: RuntimeLimits {
@@ -53,7 +54,7 @@ fn registry(tools: Vec<ManagedToolConfig>) -> Arc<ToolRegistry> {
 	)
 }
 
-fn tool(name: &str, builtin: Option<BuiltinTool>) -> ManagedToolConfig {
+pub(super) fn tool(name: &str, builtin: Option<BuiltinTool>) -> ManagedToolConfig {
 	let backend = match builtin {
 		Some(BuiltinTool::CodeInterpreter) => ToolBackendConfig::E2b {
 			api_url: "http://127.0.0.1:18080".parse().unwrap(),
@@ -72,6 +73,57 @@ fn tool(name: &str, builtin: Option<BuiltinTool>) -> ManagedToolConfig {
 		builtin,
 		backend,
 	}
+}
+
+#[test]
+fn managed_format_labels_are_stable() {
+	assert_eq!(telemetry::ManagedFormat::Responses.as_str(), "responses");
+	assert_eq!(telemetry::ManagedFormat::Messages.as_str(), "messages");
+}
+
+#[test]
+fn tool_runtime_errors_render_the_anthropic_error_envelope() {
+	let response = ToolRuntimeError::invalid_request("bad tools").into_anthropic_response();
+	assert_eq!(response.status(), ::http::StatusCode::BAD_REQUEST);
+	assert_eq!(
+		response
+			.headers()
+			.get(::http::header::CONTENT_TYPE)
+			.unwrap(),
+		"application/json"
+	);
+
+	let response = ToolRuntimeError::deadline_exceeded().into_anthropic_response();
+	assert_eq!(response.status(), ::http::StatusCode::GATEWAY_TIMEOUT);
+}
+
+#[test]
+fn infrastructure_errors_render_an_anthropic_api_error() {
+	assert_eq!(
+		ToolInfrastructureError::Timeout.to_anthropic_error(),
+		json!({
+			"type": "error",
+			"error": {
+				"type": "api_error",
+				"message": ToolInfrastructureError::Timeout.public_message(),
+			}
+		})
+	);
+}
+
+#[tokio::test]
+async fn anthropic_invalid_request_body_carries_the_sanitized_message() {
+	let response = ToolRuntimeError::invalid_request("bad tools").into_anthropic_response();
+	let body = crate::http::read_body_with_limit(response.into_body(), 4096)
+		.await
+		.unwrap();
+	assert_eq!(
+		serde_json::from_slice::<Value>(&body).unwrap(),
+		json!({
+			"type": "error",
+			"error": {"type": "invalid_request_error", "message": "bad tools"}
+		})
+	);
 }
 
 #[test]
@@ -1189,8 +1241,8 @@ async fn remote_mcp_tools_are_installed_as_namespaced_model_functions() {
 		.unwrap();
 	assert_eq!(calls[0].public_name, "dice.roll");
 	assert_eq!(calls[0].trusted_options["remote_tool_name"], "roll");
-	let mut budget = RuntimeBudget::new(&prepared.registry, policy_client()).unwrap();
-	let outputs = execute_batch(&prepared.registry, calls, true, &mut budget)
+	let mut budget = RuntimeBudget::new(&prepared.state.registry, policy_client()).unwrap();
+	let outputs = execute_batch(&prepared.state.registry, calls, true, &mut budget)
 		.await
 		.unwrap();
 	assert_eq!(outputs[0]["type"], "function_call_output");
@@ -1499,6 +1551,7 @@ fn maps_web_search_to_exact_function_schema_and_retains_trusted_options() {
 	);
 	assert_eq!(
 		prepared
+			.state
 			.registry
 			.trusted_options("_agentgateway_web_search"),
 		Some(&json!({
@@ -1539,6 +1592,7 @@ fn preserves_public_web_search_context_sizes_in_http_contract() {
 		};
 		assert_eq!(
 			prepared
+				.state
 				.registry
 				.trusted_options("_agentgateway_web_search"),
 			Some(&json!({"search_context_size": context_size})),
@@ -1799,7 +1853,7 @@ fn programmatic_call_id_and_catalog_are_bounded() {
 			},
 		);
 	}
-	prepared.programmatic_tools = Arc::new(oversized);
+	prepared.state.programmatic_tools = Arc::new(oversized);
 	let error = prepared
 		.refresh_programmatic_schema()
 		.expect_err("the aggregate programmatic catalog must be bounded");
@@ -1950,11 +2004,11 @@ fn programmatic_mcp_catalog_is_bounded_during_incremental_installation() {
 	let error = rejected.expect("aggregate catalog growth must be rejected during installation");
 	assert!(error.to_string().contains("catalog exceeds"));
 	assert!(
-		prepared.programmatic_catalog_bytes <= super::PROGRAMMATIC_MAX_CATALOG_BYTES,
+		prepared.state.programmatic_catalog_bytes <= super::PROGRAMMATIC_MAX_CATALOG_BYTES,
 		"catalog accounting exceeded its hard bound"
 	);
 	assert!(
-		prepared.programmatic_tools.len() < 5 * super::remote_mcp::MAX_DISCOVERED_TOOLS,
+		prepared.state.programmatic_tools.len() < 5 * super::remote_mcp::MAX_DISCOVERED_TOOLS,
 		"the overflowing tool was inserted before rejection"
 	);
 }
@@ -1973,7 +2027,7 @@ fn parallel_tool_calls_false_is_retained_in_prepared_runtime() {
 	let Activation::Active(prepared) = activation else {
 		panic!("expected active runtime");
 	};
-	assert!(!prepared.parallel);
+	assert!(!prepared.state.parallel);
 }
 
 #[test]
@@ -2408,7 +2462,7 @@ fn nested_web_results_and_application_error_text_are_bounded() {
 	assert!(serde_json::to_vec(&application).unwrap().len() <= 120);
 }
 
-struct BatchBackend;
+pub(super) struct BatchBackend;
 
 #[async_trait::async_trait]
 impl ToolBackend for BatchBackend {
@@ -3169,17 +3223,20 @@ async fn program_sandbox_execution_does_not_consume_tool_call_budget() {
 }
 
 struct FakeResponsesRoundTrip {
-	rounds: VecDeque<super::runner::ModelRound>,
+	rounds: VecDeque<super::runner::ModelRound<crate::llm::BufferedResponsesRound>>,
 	requests: Vec<Value>,
 }
 
 #[async_trait::async_trait]
-impl super::runner::ResponsesRoundTrip for FakeResponsesRoundTrip {
+impl super::conversation::ModelRoundTrip<responses::Request, crate::llm::BufferedResponsesRound>
+	for FakeResponsesRoundTrip
+{
 	async fn execute_round(
 		&mut self,
 		request: &responses::Request,
 		_remaining: Duration,
-	) -> Result<super::runner::ModelRound, super::ToolRuntimeError> {
+	) -> Result<super::runner::ModelRound<crate::llm::BufferedResponsesRound>, super::ToolRuntimeError>
+	{
 		self
 			.requests
 			.push(serde_json::to_value(request).expect("serializable request"));
@@ -3187,7 +3244,9 @@ impl super::runner::ResponsesRoundTrip for FakeResponsesRoundTrip {
 	}
 }
 
-fn successful_model_round(output: Vec<Value>) -> super::runner::ModelRound {
+fn successful_model_round(
+	output: Vec<Value>,
+) -> super::runner::ModelRound<crate::llm::BufferedResponsesRound> {
 	super::runner::ModelRound::Success(Box::new(crate::llm::BufferedResponsesRound {
 		response: response_with_calls(output.clone()),
 		raw_output: output,
@@ -3195,14 +3254,14 @@ fn successful_model_round(output: Vec<Value>) -> super::runner::ModelRound {
 	}))
 }
 
-struct ReplayProgramState {
-	outcomes: Mutex<VecDeque<Value>>,
-	replay_lengths: Mutex<Vec<usize>>,
-	replays: Mutex<Vec<Value>>,
+pub(super) struct ReplayProgramState {
+	pub(super) outcomes: Mutex<VecDeque<Value>>,
+	pub(super) replay_lengths: Mutex<Vec<usize>>,
+	pub(super) replays: Mutex<Vec<Value>>,
 }
 
-struct ReplayProgramSandbox {
-	state: Arc<ReplayProgramState>,
+pub(super) struct ReplayProgramSandbox {
+	pub(super) state: Arc<ReplayProgramState>,
 }
 
 struct LargeProgramToolBackend {
@@ -3310,7 +3369,7 @@ async fn runner_replays_python_until_program_output() {
 		replays: Mutex::new(Vec::new()),
 	});
 	let budget = RuntimeBudget::with_test_backends_and_program_sandbox(
-		&runtime.registry,
+		&runtime.state.registry,
 		HashMap::from([
 			(
 				super::WEB_SEARCH_FUNCTION.to_owned(),
@@ -3409,7 +3468,7 @@ async fn runner_fits_nested_output_into_replay_after_tool_execution() {
 	});
 	let backend_calls = Arc::new(AtomicUsize::new(0));
 	let budget = RuntimeBudget::with_test_backends_and_program_sandbox(
-		&runtime.registry,
+		&runtime.state.registry,
 		HashMap::from([(
 			super::CODE_INTERPRETER_FUNCTION.to_owned(),
 			Arc::new(LargeProgramToolBackend {
@@ -3495,7 +3554,7 @@ async fn capture_program_run_logs(max_level: tracing::Level) -> String {
 		replays: Mutex::new(Vec::new()),
 	});
 	let budget = RuntimeBudget::with_test_backends_and_program_sandbox(
-		&runtime.registry,
+		&runtime.state.registry,
 		HashMap::new(),
 		Arc::new(ReplayProgramSandbox { state }),
 	);
@@ -3587,7 +3646,7 @@ async fn runner_terminates_on_program_replay_contract_error() {
 		replays: Mutex::new(Vec::new()),
 	});
 	let budget = RuntimeBudget::with_test_backends_and_program_sandbox(
-		&runtime.registry,
+		&runtime.state.registry,
 		HashMap::from([(
 			super::WEB_SEARCH_FUNCTION.to_owned(),
 			Arc::new(BatchBackend) as Arc<dyn ToolBackend>,
@@ -3724,7 +3783,7 @@ async fn runner_replays_programmatic_weather_mcp_three_day_forecast() {
 		replays: Mutex::new(Vec::new()),
 	});
 	let budget = RuntimeBudget::with_test_backends_and_program_sandbox(
-		&runtime.registry,
+		&runtime.state.registry,
 		HashMap::from([(
 			"_agentgateway_mcp_0_0".to_owned(),
 			Arc::new(WeatherMcpBackend {
@@ -3802,7 +3861,10 @@ async fn runner_rejects_non_completed_function_calls_before_backend_side_effects
 		};
 		let state = Arc::new(ControlledState::default());
 		let backend = ControlledBackend::new(state.clone(), []);
-		let budget = controlled_budget(&runtime.registry, [("managed", Arc::new(backend) as _)]);
+		let budget = controlled_budget(
+			&runtime.state.registry,
+			[("managed", Arc::new(backend) as _)],
+		);
 		let mut call = function_call("managed", "call_1", "{}");
 		match status {
 			Some(status) => call["status"] = json!(status),
@@ -3849,7 +3911,10 @@ async fn runner_owns_round_history_usage_and_summary() {
 		panic!("managed request must activate the runtime");
 	};
 	let backend = ControlledBackend::new(Arc::new(ControlledState::default()), []);
-	let budget = controlled_budget(&runtime.registry, [("managed", Arc::new(backend) as _)]);
+	let budget = controlled_budget(
+		&runtime.state.registry,
+		[("managed", Arc::new(backend) as _)],
+	);
 	let mut round_trip = FakeResponsesRoundTrip {
 		rounds: VecDeque::from([
 			successful_model_round(vec![function_call("managed", "call_1", r#"{"x":1}"#)]),
@@ -4315,7 +4380,7 @@ fn assert_runtime_registry_schema(mode: HistogramMode, families: &[MetricFamily]
 	let schemas = [
 		(
 			"agentgateway_tool_runtime_requests_total",
-			&["outcome"][..],
+			&["format", "outcome"][..],
 			MetricType::Counter,
 			"",
 		),
@@ -4457,6 +4522,7 @@ fn assert_runtime_registry_schema(mode: HistogramMode, families: &[MetricFamily]
 						]
 						.contains(&value)
 					),
+					"format" => assert!(["responses", "messages"].contains(&value)),
 					"outcome" if name == "agentgateway_tool_runtime_calls_total" => {
 						assert!(call_outcomes.contains(&value))
 					},
@@ -4471,16 +4537,20 @@ fn assert_runtime_registry_schema(mode: HistogramMode, families: &[MetricFamily]
 	}
 
 	let requests = runtime["agentgateway_tool_runtime_requests_total"];
+	assert_eq!(requests.metric.len(), 2);
 	assert_eq!(
-		counter_value(requests, &[("outcome", "success")]),
+		counter_value(requests, &[("outcome", "success"), ("format", "responses")],),
 		Some(1.0)
 	);
 	assert_eq!(
-		counter_value(requests, &[("outcome", "timeout")]),
+		counter_value(requests, &[("outcome", "timeout"), ("format", "messages")],),
 		Some(1.0)
 	);
 	assert_eq!(
-		counter_value(requests, &[("outcome", "infrastructure_error")]),
+		counter_value(
+			requests,
+			&[("outcome", "infrastructure_error"), ("format", "responses")],
+		),
 		None
 	);
 	let calls = runtime["agentgateway_tool_runtime_calls_total"];
@@ -4639,6 +4709,7 @@ async fn runtime_metrics_are_bounded_and_content_free() {
 		);
 		let mut timed_out =
 			controlled_budget_with_metrics(&timed, [("operator_search", backend)], metrics);
+		timed_out.set_managed_format(telemetry::ManagedFormat::Messages);
 		timed_out.set_request_id(Some(SENSITIVE_REQUEST_ID.into()));
 		timed_out.start_model_round().unwrap();
 		let error = execute_batch(
@@ -5559,7 +5630,7 @@ fn tool_search_calls_are_bounded_and_counted_against_the_budget() {
 	};
 	assert_eq!(error.r#type, "tool_search_limit");
 
-	let mut budget = RuntimeBudget::new(&prepared.registry, policy_client()).unwrap();
+	let mut budget = RuntimeBudget::new(&prepared.state.registry, policy_client()).unwrap();
 	budget.reserve_calls(2).unwrap();
 	assert_eq!(
 		budget.tool_calls(),
@@ -5591,7 +5662,7 @@ async fn runner_loads_a_deferred_tool_through_tool_search_and_hides_the_search()
 		panic!("tool_search must activate the runtime");
 	};
 	let budget = RuntimeBudget::with_test_backends(
-		&runtime.registry,
+		&runtime.state.registry,
 		HashMap::from([(
 			"managed".to_owned(),
 			Arc::new(BatchBackend) as Arc<dyn ToolBackend>,

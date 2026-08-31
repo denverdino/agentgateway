@@ -17,7 +17,7 @@ use tracing::{debug, trace};
 use crate::HistogramMode;
 use crate::llm::tool_runtime::{
 	SandboxOperationDurationLabels, SandboxOperationLabels, ToolCallDurationLabels, ToolCallLabels,
-	ToolLabels, ToolRuntimeLimitLabels, ToolRuntimeOutcomeLabels,
+	ToolLabels, ToolRuntimeLimitLabels, ToolRuntimeOutcomeLabels, ToolRuntimeRequestLabels,
 };
 use crate::mcp::MCPOperation;
 use crate::proxy::ProxyResponseReason;
@@ -302,7 +302,7 @@ pub struct Metrics {
 	// metrics for request retries
 	pub retries: Counter,
 
-	pub tool_runtime_requests: Family<ToolRuntimeOutcomeLabels, counter::Counter>,
+	pub tool_runtime_requests: Family<ToolRuntimeRequestLabels, counter::Counter>,
 	pub tool_runtime_model_rounds: Family<ToolRuntimeOutcomeLabels, counter::Counter>,
 	pub tool_runtime_model_round_duration: PromHistogram,
 	pub tool_runtime_calls: Family<ToolCallLabels, counter::Counter>,
